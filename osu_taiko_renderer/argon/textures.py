@@ -98,15 +98,26 @@ def bake_note(top, bot, *, symbol="chevron", n=_N):
     return (np.clip(out, 0, 1) * 255).astype(np.uint8)
 
 
-def bake_swell_ring(n=_N):
-    """Large white target ring for the swell (DefaultSwell target ring)."""
-    img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+def bake_swell_ring(n=512):
+    """DefaultSwell target ring: two concentric borders (thick 1.4 + thin 1.0,
+    YellowDark@0.25 additive in lazer). Baked WHITE and 2x supersampled at high
+    resolution so it stays CRISP when the swell scales it up to 5× the note
+    (a low-res un-antialiased ring stair-steps badly when magnified); the caller
+    tints it YellowDark + draws it at reduced alpha to match lazer's faint gold
+    ring rather than the old hard white one."""
+    ss = 2
+    S = n * ss
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    pad = 6
-    d.ellipse([pad, pad, n - pad, n - pad], outline=(255, 255, 255, 255),
-              width=max(4, n // 36))
-    d.ellipse([n * 0.10, n * 0.10, n * 0.90, n * 0.90],
-              outline=(255, 255, 255, 120), width=max(2, n // 80))
+    m = int(S * 0.02)
+    # thick outer border (target_ring_thick_border) near the edge
+    d.ellipse([m, m, S - m, S - m], outline=(255, 255, 255, 255),
+              width=max(2, int(S * 0.013)))
+    # thin inner border (target_ring_thin_border), just inside the thick one
+    gap = int(S * 0.045)
+    d.ellipse([m + gap, m + gap, S - m - gap, S - m - gap],
+              outline=(255, 255, 255, 200), width=max(1, int(S * 0.007)))
+    img = img.resize((n, n), Image.LANCZOS)      # antialias down to base res
     return np.array(img)
 
 

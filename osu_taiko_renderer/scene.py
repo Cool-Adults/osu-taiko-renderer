@@ -566,9 +566,12 @@ class TaikoSim:
                         sp.append(Sprite(sx, cy, exp_d, exp_d, "argon_swell_glow",
                                          (1.0, 0.92, 0.32, exp_a)))
 
-                # thin target ring on top of the glow.
+                # thin target ring on top of the glow — DefaultSwell tints it
+                # YellowDark(eeaa00)@0.25 additive; on our dark playfield we draw
+                # that gold crisp ring at a readable alpha (was a hard white ring,
+                # which broke the swell's all-gold Argon theme).
                 sp.append(Sprite(sx, cy, ring_d, ring_d, "argon_swell_ring",
-                                 (1, 1, 1, 0.9 * body_alpha)))
+                                 (0.95, 0.71, 0.09, 0.8 * body_alpha)))
 
                 # centre asterisk: spins by completion * Duration / 8 (degrees).
                 cd = g.big_d * body_scale
