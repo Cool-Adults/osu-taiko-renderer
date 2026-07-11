@@ -52,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--show-hp", action=BA, default=True)
     ap.add_argument("--show-grade", action=BA, default=True)
     ap.add_argument("--show-mods", action=BA, default=True)
+    ap.add_argument("--logo", action=BA, default=False,
+                    help="show_logo: the R3D 'R' tile splash during the intro, "
+                         "fading out as gameplay starts (parity with std/catch)")
     # Accept-and-ignore: lets the shared render pipeline pass mode-agnostic
     # flags it also sends to the catch renderer without erroring here.
     args, _unknown = ap.parse_known_args(argv)
@@ -82,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         show_hp_bar=args.show_hp,
         show_grade=args.show_grade,
         show_mods=args.show_mods,
+        show_logo=args.logo,
     )
     if args.results_seconds is not None:
         cfg.results_ms = int(args.results_seconds * 1000)

@@ -142,6 +142,9 @@ class RenderConfig:
     show_mods: bool = True
     show_pp_counter: bool = True
     show_hit_counter: bool = True
+    # intro R3D "R" splash (parity with std/catch show_logo; off by default so
+    # existing renders are unchanged)
+    show_logo: bool = False
 
 
 @dataclass

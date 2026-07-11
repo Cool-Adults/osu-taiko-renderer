@@ -93,6 +93,11 @@ def render_core(
         start_ms = int(first - approach - lead)
     else:
         start_ms = min(0, int(first - preempt - lead))
+    # intro R3D splash window opens at the render's first frame (no seizure
+    # card in taiko, so it begins immediately -- std offsets by the seizure
+    # duration). The sim fades it out at the first note's scroll-in
+    # (sim.first_spawn_ms), the same "first approach" the std/catch use.
+    sim.logo_start_ms = start_ms if cfg.show_logo else None
     # A failed/quit replay stops recording at death; end the video there rather
     # than playing the rest of the map (sim flags this from the life-bar / where
     # the replay frames stop).
@@ -127,6 +132,9 @@ def render_core(
     else:
         for key, rgba in build_textures(cfg.skin_dir).items():
             renderer.upload_texture(key, rgba)
+    from .assets import bake_logo_tile, logo_glow_rgba
+    renderer.upload_texture("logo_tile", bake_logo_tile())
+    renderer.upload_texture("logo_glow", logo_glow_rgba())
     if bg is not None:
         renderer.upload_texture("bg", _bg_cover(bg, w, h, cfg.bg_blur))
 

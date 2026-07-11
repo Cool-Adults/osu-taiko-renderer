@@ -86,6 +86,17 @@ class TaikoSim:
         self.bar_lines = getattr(bm, "bar_lines", [])
         self.kiai = getattr(bm, "kiai_ranges", [])
         self.timing = getattr(bm, "timing", None)
+        # R3D intro splash (show_logo): render.py sets logo_start_ms when the
+        # flag is on; the splash fades out exactly as the first note begins
+        # its scroll-in (first object time - its on-screen travel time, i.e.
+        # the same "first approach start" the std/catch splashes fade out at).
+        self.logo_start_ms: float | None = None
+        if bm.objects:
+            _first = min(bm.objects, key=lambda o: o.time_ms)
+            _fsv = max(getattr(_first, "scroll_vel", 1.0) or 1.0, 0.1)
+            self.first_spawn_ms = _first.time_ms - self.geo.scroll_time / _fsv
+        else:
+            self.first_spawn_ms = 0.0
         self.note_hit: dict[int, tuple[int, str]] = {}
         self._judge(frames)
 
@@ -613,6 +624,10 @@ class TaikoSim:
             if kp > 0.001:        # kiai beat flash on the note (additive white)
                 sp.append(Sprite(x, cy, d, d, "argon_note_flash", (1, 1, 1, kp * na)))
 
+        # R3D intro splash -- topmost intro element, over the idle scene
+        if self.logo_start_ms is not None:
+            sp.extend(self._logo_sprites(t))
+
         combo, great, ok, miss, score, acc, hp = self._state_at(t)
         s.combo, s.score, s.accuracy, s.hp = combo, score, acc, hp
         s.counts = (great, ok, miss)
@@ -621,6 +636,29 @@ class TaikoSim:
         hdr = self._scorev2[-1] if self._scorev2 else 0
         s.pp = (self._final_pp * (score / hdr)) if hdr > 0 else 0.0
         return s
+
+    def _logo_sprites(self, t: int) -> list[Sprite]:
+        """The R3D 'R' tile intro splash (show_logo), fading out exactly as
+        the first note begins its scroll-in -- ported from the std renderer's
+        _draw_logo (via the catch port) so the splash is identical across
+        modes. std/catch draw the halo additively; taiko's sprite pass is
+        straight-alpha only, so the same radial glow texture is blended
+        normally -- visually equivalent over the dark intro playfield (the
+        same approximation the swell glow already uses)."""
+        from .effects import logo_alpha, logo_scale, LOGO_UI_SIZE
+        la = logo_alpha(t, self.logo_start_ms, self.first_spawn_ms)
+        if la is None:
+            return []
+        k_ui = self.h / 1080.0
+        d = LOGO_UI_SIZE * k_ui * logo_scale(t, self.logo_start_ms)
+        cx = self.w / 2.0
+        cy = self.h * 0.44
+        return [
+            Sprite(cx, cy, d * 1.9, d * 1.9, texture_key="logo_glow",
+                   color=(0.95, 0.28, 0.30, 0.45 * la)),
+            Sprite(cx, cy, d, d, texture_key="logo_tile",
+                   color=(1.0, 1.0, 1.0, la)),
+        ]
 
     def key_counts(self, t: int):
         """(B1,B2,B3,B4) press counts up to t — left→right: rim-L, centre-L,
