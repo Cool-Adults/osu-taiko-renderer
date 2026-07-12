@@ -12,6 +12,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -234,6 +235,7 @@ def render_core(
     #   * The ffmpeg pipe write (tobytes + stdin.write) happens on a writer
     #     thread behind a small bounded queue (_FrameWriter).
     # Frame count, order and bytes are identical to the synchronous path.
+    _t_render0 = time.monotonic()
     writer = _FrameWriter(proc)
     pending = deque()   # (scene, exps, judges, drum_flashes) awaiting pixels
 
@@ -289,6 +291,11 @@ def render_core(
                 pass
         ret = proc.wait()
         renderer.release()
+        import sys as _rsys
+        _wall = time.monotonic() - _t_render0
+        print(f"done: {n_frames} frames in {_wall:.1f}s "
+              f"({(n_frames / _wall) if _wall else 0.0:.1f} fps) ret={ret}",
+              file=_rsys.stderr, flush=True)
 
     if ret != 0:
         tail = ""
