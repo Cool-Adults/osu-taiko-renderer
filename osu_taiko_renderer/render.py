@@ -7,7 +7,12 @@ with PIL after GL readback — cheap and avoids a GL text pass for Phase 1.
 from __future__ import annotations
 
 import hashlib
+import os
+import queue
 import subprocess
+import sys
+import threading
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +28,69 @@ from .scene import TaikoSim
 
 class TaikoRenderError(RuntimeError):
     pass
+
+
+class _FrameWriter:
+    """ffmpeg stdin writer thread — ported from the std renderer's proven
+    FfmpegPipe (osu_std_renderer/record/encode.py), minus the process
+    ownership (this renderer already owns its ffmpeg Popen).
+
+    Frames are handed to the thread over a small bounded queue: the
+    serialisation (`tobytes` — a negative-stride flip copy) and the blocking
+    pipe write happen OFF the render thread, overlapping the next frame's
+    draw. Order is FIFO so the byte stream ffmpeg sees is unchanged. The
+    queue bounds memory (~4 frames) and provides natural backpressure when
+    ffmpeg is the bottleneck; writer errors surface on the next push()
+    instead of deadlocking the producer.
+
+    R3D_FRAME_MD5=1 hashes every raw frame writer-side (blake2b) and prints
+    one digest at close — bit-identical output proof across perf changes
+    (same env/mechanism as the std renderer)."""
+
+    _QUEUE_FRAMES = 4
+
+    def __init__(self, proc):
+        self._stdin = proc.stdin
+        self._q: "queue.Queue" = queue.Queue(maxsize=self._QUEUE_FRAMES)
+        self._werr: BaseException | None = None
+        self._hash = None
+        self._hash_frames = 0
+        if os.environ.get("R3D_FRAME_MD5"):
+            self._hash = hashlib.blake2b(digest_size=16)
+        self._thread = threading.Thread(target=self._writer,
+                                        name="ffmpeg-writer", daemon=True)
+        self._thread.start()
+
+    def _writer(self) -> None:
+        while True:
+            frame = self._q.get()
+            if frame is None:
+                return
+            if self._werr is not None:
+                continue          # drain (never write after an error)
+            try:
+                data = frame.tobytes()
+                if self._hash is not None:
+                    self._hash.update(data)
+                    self._hash_frames += 1
+                self._stdin.write(data)
+            except BaseException as e:  # noqa: BLE001 — surfaced on push()
+                self._werr = e
+
+    def push(self, frame_rgb) -> None:
+        """Queue one frame. Re-raises the writer thread's error, so a dead
+        ffmpeg surfaces here just like the old synchronous write did
+        (BrokenPipeError included)."""
+        if self._werr is not None:
+            raise self._werr
+        self._q.put(frame_rgb)
+
+    def close(self) -> None:
+        self._q.put(None)
+        self._thread.join()
+        if self._hash is not None:
+            print(f"frame-stream-hash: {self._hash.hexdigest()} "
+                  f"({self._hash_frames} frames)", file=sys.stderr, flush=True)
 
 
 def render_taiko(
@@ -153,34 +221,67 @@ def render_core(
 
     from .hud import draw_results
     last_gameplay = None
+    # Async pipeline (ported from the std renderer's proven design):
+    #   * GPU readback goes through a 3-deep PBO ring (read_rgb_async returns
+    #     None while the ring fills; frames pop out ~2 frames late, in strict
+    #     submission order; read_drain() flushes the tail).
+    #   * The CPU-side compositing (Argon effects + HUD) is deferred until a
+    #     frame's pixels pop out of the ring: everything it needs is captured
+    #     at BUILD time — (scene, active_effects(t), drum_flashes(t)) — and
+    #     queued alongside. All of it is a pure function of sim state
+    #     precomputed in __init__ (build_scene mutates nothing), called once
+    #     per frame in frame order, exactly as the synchronous path did.
+    #   * The ffmpeg pipe write (tobytes + stdin.write) happens on a writer
+    #     thread behind a small bounded queue (_FrameWriter).
+    # Frame count, order and bytes are identical to the synchronous path.
+    writer = _FrameWriter(proc)
+    pending = deque()   # (scene, exps, judges, drum_flashes) awaiting pixels
+
+    def _emit_gameplay(raw):
+        nonlocal last_gameplay
+        p_scene, p_exps, p_judges, p_drums = pending.popleft()
+        out = effects.composite(raw, p_exps, p_judges, p_drums)
+        out = hud.overlay(out, p_scene)
+        last_gameplay = out
+        writer.push(out)
+
     try:
-        for i in range(n_frames):
-            if i < gameplay_frames:
-                t = int(start_ms + i * map_step)
-                scene = sim.build_scene(t)
-                renderer.begin()
-                renderer.draw(scene.sprites)
-                rgb = renderer.read_rgb()
-                exps, judges = sim.active_effects(t)
-                rgb = effects.composite(rgb, exps, judges, sim.drum_flashes(t))
-                rgb = hud.overlay(rgb, scene)
-                last_gameplay = rgb
-            else:
-                # outro: frozen final gameplay frame, then the results card
-                # fades in (consistent with the mania renderer). Real-time.
-                t = int(gameplay_end_ms + (i - gameplay_frames) * frame_ms)
-                rgb = last_gameplay.copy() if last_gameplay is not None else \
-                    renderer.read_rgb()
-                if cfg.show_results and t >= results_start_ms:
-                    op = min(1.0, (t - results_start_ms) / FADE_MS)
-                    rgb = hud.draw_results(rgb, op)
-            try:
-                proc.stdin.write(rgb.tobytes())
-            except BrokenPipeError:
-                break
-            if progress_callback and i % cfg.fps == 0:
-                progress_callback(int(i / n_frames * 100))
+        try:
+            for i in range(n_frames):
+                if i < gameplay_frames:
+                    t = int(start_ms + i * map_step)
+                    scene = sim.build_scene(t)
+                    renderer.begin()
+                    renderer.draw(scene.sprites)
+                    exps, judges = sim.active_effects(t)
+                    pending.append((scene, exps, judges, sim.drum_flashes(t)))
+                    raw = renderer.read_rgb_async()
+                    if raw is not None:
+                        _emit_gameplay(raw)
+                else:
+                    # gameplay -> outro boundary: flush the PBO ring first so
+                    # last_gameplay is the true final gameplay frame and
+                    # ordering is preserved across the boundary.
+                    for raw in renderer.read_drain():
+                        _emit_gameplay(raw)
+                    # outro: frozen final gameplay frame, then the results card
+                    # fades in (consistent with the mania renderer). Real-time.
+                    t = int(gameplay_end_ms + (i - gameplay_frames) * frame_ms)
+                    rgb = last_gameplay.copy() if last_gameplay is not None else \
+                        renderer.read_rgb()
+                    if cfg.show_results and t >= results_start_ms:
+                        op = min(1.0, (t - results_start_ms) / FADE_MS)
+                        rgb = hud.draw_results(rgb, op)
+                    writer.push(rgb)
+                if progress_callback and i % cfg.fps == 0:
+                    progress_callback(int(i / n_frames * 100))
+            # map end with no outro configured: flush the ring tail.
+            for raw in renderer.read_drain():
+                _emit_gameplay(raw)
+        except BrokenPipeError:
+            pass               # ffmpeg died — surfaced via ret below
     finally:
+        writer.close()
         if proc.stdin:
             try:
                 proc.stdin.close()

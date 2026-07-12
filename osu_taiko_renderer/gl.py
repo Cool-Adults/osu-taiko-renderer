@@ -90,6 +90,12 @@ class SpriteRenderer:
         self._textures: dict[str, moderngl.Texture] = {}
         self._white = self._make_texture_rgba(np.full((1, 1, 4), 255, dtype="u1"))
 
+        # async PBO ring state (read_rgb_async / read_drain) — ported from
+        # the std renderer's proven pipeline (osu_std_renderer/render/gl.py)
+        self._pbos: list["moderngl.Buffer"] | None = None
+        self._pbo_head = 0
+        self._pbo_tail = 0
+
     # --- texture management ---------------------------------------------------
 
     def upload_texture(self, key: str, rgba: np.ndarray) -> None:
@@ -129,6 +135,43 @@ class SpriteRenderer:
             self.prog["u_size"].value = (sp.w, sp.h)
             self.prog["u_rot"].value = sp.rotation
             self.vao.render(moderngl.TRIANGLE_STRIP)
+
+    _PBO_RING = 3
+
+    def read_rgb_async(self) -> "np.ndarray | None":
+        """Queue an async readback of the current fbo into a small PBO
+        ring and return the OLDEST completed frame (top-left origin), or
+        None while the ring is still filling. Frames come back in strict
+        submission order — the render loop pushes them straight to ffmpeg,
+        so the byte stream is identical to the synchronous read_rgb path,
+        just ~RING-1 frames late. read_drain() flushes the tail. (Ported
+        from the std renderer's proven osu_std_renderer/render/gl.py.)"""
+        if self._pbos is None:
+            size = self.width * self.height * 3
+            self._pbos = [self.ctx.buffer(reserve=size)
+                          for _ in range(self._PBO_RING)]
+        buf = self._pbos[self._pbo_head % len(self._pbos)]
+        self.fbo.read_into(buf, components=3, alignment=1)
+        self._pbo_head += 1
+        if self._pbo_head - self._pbo_tail < len(self._pbos):
+            return None
+        return self._pop_pbo()
+
+    def _pop_pbo(self) -> np.ndarray:
+        buf = self._pbos[self._pbo_tail % len(self._pbos)]
+        self._pbo_tail += 1
+        data = buf.read()
+        arr = np.frombuffer(data, dtype="u1").reshape(
+            (self.height, self.width, 3))
+        return np.flipud(arr)  # same orientation contract as read_rgb
+
+    def read_drain(self) -> list:
+        """Return every frame still in flight, oldest first (map end or
+        the gameplay->outro boundary)."""
+        out = []
+        while self._pbos is not None and self._pbo_tail < self._pbo_head:
+            out.append(self._pop_pbo())
+        return out
 
     def read_rgb(self) -> np.ndarray:
         """Return HxWx3 uint8, top-left origin (ready for ffmpeg rgb24).
