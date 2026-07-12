@@ -210,11 +210,14 @@ def _probe_encoder(cfg: RenderConfig) -> tuple[str, str | None]:
         if cfg.encoder == "h264_vaapi":
             return cfg.encoder, cfg.encoder_device or "/dev/dri/renderD128"
         return cfg.encoder, cfg.encoder_device
+    # nvenc FIRST: R3D renders on NVIDIA (2070S / 1070). The old vaapi-first
+    # auto-probe silently won over the far-faster nvenc whenever R3D_ENCODER
+    # was unset — a landmine if the worker env ever drops.
+    if _ffmpeg_has("h264_nvenc"):
+        return "h264_nvenc", None
     dev = cfg.encoder_device or "/dev/dri/renderD128"
     if Path(dev).exists() and _ffmpeg_has("h264_vaapi"):
         return "h264_vaapi", dev
-    if _ffmpeg_has("h264_nvenc"):
-        return "h264_nvenc", None
     return "libx264", None
 
 
