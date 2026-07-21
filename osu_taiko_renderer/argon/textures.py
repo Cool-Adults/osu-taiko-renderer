@@ -34,24 +34,30 @@ def _over(dst, src_rgb, src_a):
     dst[..., 3] = dst[..., 3] + src_a * (1 - dst[..., 3])
 
 
-def _chevron_mask(n, asterisk=False):
-    """White FontAwesome-AngleLeft chevron (or Asterisk for swell) coverage."""
+def _chevron_mask(n, asterisk=False, y_off=0.0):
+    """White FontAwesome-AngleLeft chevron (or Asterisk for swell) coverage.
+    `y_off` shifts the chevron vertically as a fraction of `n` (negative = up)
+    for optical centring; the asterisk stays on the geometric centre."""
     img = Image.new("L", (n, n), 0)
     d = ImageDraw.Draw(img)
     c = n / 2.0
-    h = C.ICON_SIZE * n
-    w = h * C.ICON_X_SCALE
+    cy = c + y_off * n
     if asterisk:
-        # 6-arm asterisk (FontAwesome Solid asterisk)
+        # 6-arm asterisk (FontAwesome Solid asterisk) — swell, on the icon box.
         import math
+        h = C.ICON_SIZE * n
+        w = h * C.ICON_X_SCALE
         lw = int(max(2, h * 0.22))
         for k in range(6):
             ang = math.pi / 6 + k * math.pi / 3
             dx, dy = math.cos(ang) * w * 0.55, math.sin(ang) * h * 0.55
             d.line([(c - dx, c - dy), (c + dx, c + dy)], fill=255, width=lw)
     else:
+        # note / drumroll-tick chevron — sized to the real game (see _const).
+        h = C.CHEVRON_SIZE * n
+        w = h * C.CHEVRON_X_SCALE
         lw = int(max(3, h * 0.20))
-        pts = [(c + w / 2, c - h / 2), (c - w / 2, c), (c + w / 2, c + h / 2)]
+        pts = [(c + w / 2, cy - h / 2), (c - w / 2, cy), (c + w / 2, cy + h / 2)]
         d.line(pts, fill=255, width=lw, joint="curve")
         for p in pts:                       # round the caps
             d.ellipse([p[0] - lw / 2, p[1] - lw / 2, p[0] + lw / 2, p[1] + lw / 2],
@@ -93,7 +99,8 @@ def bake_note(top, bot, *, symbol="chevron", n=_N):
     _over(out, grad[..., :3], m2)
     # 4) symbol
     if symbol:
-        sym = _chevron_mask(n, asterisk=(symbol == "asterisk"))
+        yoff = C.ICON_Y_OFFSET if symbol == "chevron" else 0.0
+        sym = _chevron_mask(n, asterisk=(symbol == "asterisk"), y_off=yoff)
         _over(out, np.ones((n, n, 3), np.float32), sym)
     return (np.clip(out, 0, 1) * 255).astype(np.uint8)
 
@@ -230,36 +237,46 @@ def bake_ring(size: int = 64, thickness: int = 8) -> np.ndarray:
 
 
 def bake_drum_flash(*, ring: bool, left: bool, n=_N):
-    """Additive press-flash for one drum half (rim or centre zone) as a smooth
-    saturated coloured glow — rim=blue, centre=pink.
+    """Additive press-flash for one drum half (ArgonInputDrumHalf): a FLAT accent
+    fill (rim annulus or centre half-disc, no inner gradient) with the glow living
+    strictly OUTSIDE the filled area — the halo is a blurred silhouette minus the
+    fill itself, so the highlight reads flat and only bleeds outward.
 
-    The OLD version drew a hard-edged pale half-disc (circular mask × a hard
-    vertical centre cut + a near-white gradient fill). Mashed rapidly, those
-    hard-edged left/right colour halves read as rectangular *bars* — what Red
-    flagged. This bakes a soft radial colour falloff, feathered at the centre
-    split and the drum edge, so presses read as clean coloured pulses."""
+    Fills are chosen SATURATED (see _const) because the flash composites additively
+    over the dark idle drum; the compositor's LANCZOS downscale to drum size
+    anti-aliases the hard shape/split edges. NOTE: an earlier version used a soft
+    radial falloff to avoid rapid-mash "bars"; Red's Argon spec is a flat fill, so
+    the hard two-semicircle split (matching lazer's drum + the idle split) is
+    intentional here."""
     r, c = _radius(n)
-    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
-    glow = np.array((C.RIM_HIT_GLOW if ring else C.CENTRE_HIT_GLOW)[:3],
-                    np.float32) / 255.0
-    inner = 1.0 - C.DRUM_RIM_SIZE
     if ring:
-        # peak across the rim annulus, 0 at its inner + outer edges
-        mid = (inner + 1.0) / 2.0
-        band = np.clip(1.0 - np.abs(r - mid) / ((1.0 - inner) / 2.0 + 1e-6),
-                       0.0, 1.0)
+        fill = C.RIM_HIT_FILL
+        glow_c = C.RIM_HIT_GLOW
+        shape = ((r > (1.0 - C.DRUM_RIM_SIZE)) & (r <= 1.0)).astype(np.float32)
     else:
-        # bright at the centre, fading out to the rim boundary
-        band = np.clip(1.0 - r / max(inner, 1e-6), 0.0, 1.0)
-    band = band ** 0.7                                   # softer, fuller falloff
-    edge = np.clip((1.02 - r) / 0.10, 0.0, 1.0)          # soft fade at drum edge
-    hx = (xx - c) / (n * 0.5)                             # -1..1 across width
-    side = (-hx) if left else hx
-    half_m = np.clip(side / 0.10 + 0.5, 0.0, 1.0)         # feathered centre split
-    a = band * edge * half_m
+        fill = C.CENTRE_HIT_FILL
+        glow_c = C.CENTRE_HIT_GLOW
+        shape = (r <= (1.0 - C.DRUM_RIM_SIZE)).astype(np.float32)
+    half = ((np.arange(n)[None, :] <= c) if left else
+            (np.arange(n)[None, :] > c)).astype(np.float32)
+    shape = shape * half
+
     out = np.zeros((n, n, 4), np.float32)
-    out[..., :3] = glow
-    out[..., 3] = a
+
+    # 1) OUTER glow only: blur the fill silhouette, subtract the fill so nothing
+    # is added inside the highlight (no inner gradient) — halo bleeds outward.
+    blur = C.DRUM_GLOW_RADIUS / C.BASE_HEIGHT * n * 0.6
+    sm = Image.fromarray((shape * 255.0).astype(np.uint8), "L").filter(
+        ImageFilter.GaussianBlur(radius=blur))
+    glow_a = np.clip(np.asarray(sm, np.float32) / 255.0 - shape, 0.0, 1.0)
+    out[..., 0], out[..., 1], out[..., 2] = (glow_c[0] / 255.0,
+                                             glow_c[1] / 255.0, glow_c[2] / 255.0)
+    out[..., 3] = glow_a * C.DRUM_GLOW_STRENGTH
+
+    # 2) FLAT fill on top: one uniform accent colour across the highlighted area.
+    fill_rgb = np.array(fill[:3], np.float32) / 255.0
+    out[..., :3] = out[..., :3] * (1 - shape[..., None]) + fill_rgb * shape[..., None]
+    out[..., 3] = np.maximum(out[..., 3], shape)
     return (np.clip(out, 0, 1) * 255).astype(np.uint8)
 
 

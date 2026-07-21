@@ -26,8 +26,16 @@ CORE_RGBA = (0, 0, 0, 190)               # ArgonCirclePiece inner black Circle
 RING1_THICKNESS = 20.0 / 70.0            # RingPiece(20/70): thick ring, accent×0.5α
 RING2_THICKNESS = 5.0 / 70.0             # RingPiece(5/70): thin ring, full accent
 RING1_ALPHA = 0.5                        # AccentColour.MultiplyAlpha(0.5)
-ICON_SIZE = 20.0 / 70.0                  # ArgonCirclePiece.ICON_SIZE (chevron)
-ICON_X_SCALE = 0.8                       # SpriteIcon Scale (0.8, 1)
+ICON_SIZE = 20.0 / 70.0                  # ArgonCirclePiece.ICON_SIZE (icon BOX; swell asterisk)
+ICON_X_SCALE = 0.8                       # SpriteIcon Scale (0.8, 1) — asterisk
+# Note chevron, TUNED to the real game (reference/argon_baseline measured: the
+# visible ‹ is h/d≈0.27, w/d≈0.135, centred). lazer's ICON_SIZE is the icon BOX;
+# the FontAwesome AngleLeft glyph only fills part of it, so a box-filling procedural
+# chevron came out too big/wide. total_h = size*(1+stroke) , total_w = (size*xscale + size*stroke).
+CHEVRON_SIZE = 0.225                     # vertex→tip vertical span (frac of note)
+CHEVRON_X_SCALE = 0.40                   # width/height — narrow ‹ (was 0.8, ~2× too wide)
+ICON_Y_OFFSET = 0.0                      # chevron vertical nudge (frac; -=up). Game is
+                                         # vertically CENTRED, so 0 matches it.
 HIT_FLASH_PEAK = 0.9                     # flash.FadeTo(0.9) on hit
 HIT_FLASH_MS = 500                       # .FadeOut(500, OutQuint)
 
@@ -44,10 +52,18 @@ DRUM_RIM_GRAY = (51, 51, 51, 255)         # OsuColour.Gray(51/255) rim base
 DRUM_CENTRE_GRAY = (64, 64, 64, 255)      # OsuColour.Gray(64/255) centre base
 DRUM_SPLIT_GRAY_A = (38, 38, 38, 255)     # Gray(38/255)
 DRUM_SPLIT_GRAY_B = (48, 48, 48, 255)     # Gray(48/255)
-RIM_HIT_GRAD = ((227, 248, 255, 255), (198, 245, 255, 255))   # horizontal
+RIM_HIT_GRAD = ((227, 248, 255, 255), (198, 245, 255, 255))   # horizontal (unused now)
 RIM_HIT_GLOW = (126, 215, 253, 255)
 CENTRE_HIT_GRAD = ((255, 227, 236, 255), (255, 198, 211, 255))
 CENTRE_HIT_GLOW = (255, 147, 199, 255)
+# The press highlight itself is a FLAT accent fill (no inner gradient); the glow
+# lives strictly OUTSIDE it (ArgonInputDrumHalf = flat Circle + EdgeEffect halo).
+# Fills are additive over the dark idle drum (gray ~51-64), so they're chosen
+# SATURATED — fill ≈ target − idle-gray — to land on a flat cyan/pink instead of
+# clipping to white: rim→~(140,215,255), centre→~(255,150,200).
+RIM_HIT_FILL = (89, 164, 204, 255)         # flat cyan kat highlight
+CENTRE_HIT_FILL = (191, 86, 136, 255)      # flat pink don highlight
+DRUM_GLOW_STRENGTH = 1.0                   # additive strength of the outer halo
 DRUM_GLOW_RADIUS = 50                      # EdgeEffect glow radius (local px @200H)
 DRUM_PRESS_ALPHA = 0.5                     # +0.5 on press
 DRUM_PRESS_DOWN_MS = 40

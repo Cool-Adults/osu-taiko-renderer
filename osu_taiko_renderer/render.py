@@ -116,6 +116,33 @@ def render_taiko(
                        progress_callback=progress_callback, osu_path=osu_path)
 
 
+def _draw_lazer_results(cache, rgb, meta, bm, opacity, *, age_ms=None,
+                        board=None, osu_path=None, sim=None):
+    """Composite the ported osu!(lazer) results screen (CatchLazerResults from
+    lazer_results.py) over `rgb`. Built ONCE on the first outro frame, then
+    re-drawn each frame at `opacity`/`age_ms` (mirrors catch's hud.draw_results
+    dispatcher). Fully fail-soft: any build/draw failure is caught, logged
+    LOUDLY, and the plain frame is returned so a render never crashes on the
+    results screen."""
+    try:
+        scr = cache.get("scr")
+        if scr is False:                 # an earlier bake failed → plain frame
+            return rgb
+        if scr is None:
+            from .lazer_results import CatchLazerResults
+            scr = CatchLazerResults((rgb.shape[1], rgb.shape[0]), meta, bm,
+                                    board=board, osu_path=osu_path, sim=sim)
+            cache["scr"] = scr
+        return scr.render_frame(rgb, opacity, age_ms)
+    except Exception as e:  # noqa: BLE001 — results must never kill a render
+        import traceback
+        print("[taiko-renderer] !!! LAZER RESULTS SCREEN FAILED — leaving the "
+              f"plain final frame: {e}", file=sys.stderr)
+        traceback.print_exc()
+        cache["scr"] = False
+        return rgb
+
+
 def render_core(
     bm,
     frames,
@@ -221,6 +248,43 @@ def render_core(
     effects = ArgonEffects(sim.geo, cfg.skin_dir)
 
     from .hud import draw_results
+    # results-screen map leaderboard (parity with std/catch): build + bake ONCE,
+    # up front, so the outro just composites the pre-baked flank cards each
+    # frame. Fully fail-soft — any problem leaves the plain results card (renders
+    # unchanged). Attached to the HUD instance; both HUD variants composite it.
+    baked_board = None
+    if cfg.show_results and getattr(cfg, "show_leaderboard", True):
+        try:
+            from .lb_cards import build_taiko_board
+            baked_board = build_taiko_board(cfg, meta, bm, "")
+        except Exception as e:  # noqa: BLE001 — a board must never break a render
+            print(f"[taiko-renderer] leaderboard skipped: {e}", file=sys.stderr)
+            baked_board = None
+    # FEATURED results-card avatar (the current player's real osu! pfp PNG).
+    # Missing/unreadable -> the results screen falls back to the procedural chip.
+    feat_bytes = None
+    _feat_png = getattr(cfg, "featured_avatar_png", None)
+    if _feat_png is not None:
+        try:
+            feat_bytes = Path(_feat_png).read_bytes() or None
+        except Exception:  # noqa: BLE001 — avatar wiring never breaks a render
+            feat_bytes = None
+    try:
+        hud.board = baked_board
+        hud.featured_avatar_bytes = feat_bytes
+    except Exception:  # noqa: BLE001 — HUD attach never breaks a render
+        pass
+    # Ported osu!(lazer) results screen (catch's CatchLazerResults): the outro
+    # draws THIS instead of hud.draw_results. Hand the featured player's real
+    # osu! avatar to the module global it reads (same mechanism as catch); the
+    # instance is built lazily on the first outro frame and cached here.
+    if cfg.show_results:
+        try:
+            from .lazer_results import set_featured_avatar_png
+            set_featured_avatar_png(getattr(cfg, "featured_avatar_png", None))
+        except Exception:  # noqa: BLE001 — avatar wiring never breaks a render
+            pass
+    _lazer_results_cache: dict = {}
     last_gameplay = None
     # Async pipeline (ported from the std renderer's proven design):
     #   * GPU readback goes through a 3-deep PBO ring (read_rgb_async returns
@@ -273,7 +337,16 @@ def render_core(
                         renderer.read_rgb()
                     if cfg.show_results and t >= results_start_ms:
                         op = min(1.0, (t - results_start_ms) / FADE_MS)
-                        rgb = hud.draw_results(rgb, op)
+                        # age_ms drives the ported lazer results' two-stage
+                        # animation (arc sweep / grade punch / score roll /
+                        # flank slide-in, then the stage-2 stats panels
+                        # unfolding from the right). osu_path lets it compute
+                        # stars + pp (rosu); sim feeds the COMBO panel its
+                        # per-object combo series. BYPASSES hud.draw_results.
+                        rgb = _draw_lazer_results(
+                            _lazer_results_cache, rgb, meta, bm, op,
+                            age_ms=float(t - results_start_ms),
+                            board=baked_board, osu_path=osu_path, sim=sim)
                     writer.push(rgb)
                 if progress_callback and i % cfg.fps == 0:
                     progress_callback(int(i / n_frames * 100))

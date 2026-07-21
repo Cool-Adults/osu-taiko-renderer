@@ -267,7 +267,7 @@ class ArgonHud:
         w, h = self.w, self.h
         m, bm = self.meta, self.bm
         ov = np.zeros((h, w, 4), np.float32)
-        ov[..., 3] = 0.70 * 255                        # dark scrim over frozen frame
+        ov[..., 3] = 255                               # opaque black bg: clean results, no gameplay-HUD bleed (like std/catch)
         cx = w // 2
         grade = str(getattr(m, "grade", "D") or "D")
         mods_i = int(getattr(m, "mods", 0) or 0)
@@ -276,13 +276,22 @@ class ArgonHud:
             gcol = _GRADE_COL["SSH"]
         else:
             gcol = _GRADE_COL.get(grade.upper(), _WHITE)
-        # title / difficulty / player (top)
+        # FEATURED player avatar — circular chip, top-centre, above the title.
+        try:
+            from ..lb_cards import bake_avatar_circle
+            _av_px = int(h * 0.11)
+            _chip = bake_avatar_circle(_av_px, m.player_name,
+                                       getattr(self, "featured_avatar_bytes", None))
+            self._compose(ov, np.array(_chip), cx, int(h * 0.045), "tc")
+        except Exception:  # noqa: BLE001 — avatar never breaks the results card
+            pass
+        # title / difficulty / player (top) — nudged down to clear the avatar chip
         title = f"{bm.artist} - {bm.title}".strip(" -")
         self._compose(ov, self.semi.render(title, int(h * 0.026), color=_WHITE),
-                      cx, int(h * 0.07), "tc")
+                      cx, int(h * 0.135), "tc")
         self._compose(ov, self.bold.render(
             f"[{bm.version}]   played by {m.player_name}", int(h * 0.018),
-            color=_LABEL), cx, int(h * 0.115), "tc")
+            color=_LABEL), cx, int(h * 0.175), "tc")
         # big grade letter
         self._compose(ov, self.bold.render(grade, int(h * 0.24), color=gcol),
                       cx, int(h * 0.15), "tc")
@@ -324,13 +333,26 @@ class ArgonHud:
         return ov.astype(np.uint8)
 
     def draw_results(self, rgb, op):
-        """Cross-fade the Argon results overlay onto the frozen final frame."""
+        """Cross-fade the Argon results overlay onto the frozen final frame, then
+        composite the per-map leaderboard flank cards (fading in with `op`)."""
         if self._results is None:
             self._results = self._build_results()
         ov = self._results
         a = (ov[..., 3:4].astype(np.float32) / 255.0) * max(0.0, min(1.0, op))
         out = rgb.astype(np.float32) * (1 - a) + ov[..., :3].astype(np.float32) * a
-        return np.clip(out, 0, 255).astype(np.uint8)
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        # flank leaderboard: composited per-frame at the results opacity so the
+        # cards unfurl with the fade. Only when a board was attached; fully
+        # fail-soft — a board must never break a render.
+        if getattr(self, "board", None) is not None:
+            try:
+                from ..lb_cards import draw_board
+                pim = Image.fromarray(out, "RGB").convert("RGBA")
+                draw_board(pim, self.board, max(0.0, min(1.0, op)))
+                out = np.asarray(pim.convert("RGB"))
+            except Exception:  # noqa: BLE001 — leaderboard never breaks a render
+                pass
+        return out
 
 
 def _fmt_time(ms):

@@ -233,10 +233,19 @@ class LegacyHud:
         if self._results is None:
             w, h = self.w, self.h
             ov = np.zeros((h, w, 4), np.float32)
-            ov[..., 3] = 0.72 * 255
+            ov[..., 3] = 255  # opaque black bg: clean results, no gameplay-HUD bleed
             ov8 = ov.astype(np.uint8)
             m = self.meta
             cx = w // 2
+            # FEATURED player avatar — circular chip centred above the score.
+            try:
+                from .lb_cards import bake_avatar_circle
+                _chip = bake_avatar_circle(
+                    int(h * 0.14), getattr(m, "player_name", ""),
+                    getattr(self, "featured_avatar_bytes", None))
+                _blit(ov8, np.array(_chip), cx, int(h * 0.05), "tc")
+            except Exception:  # noqa: BLE001 — avatar never breaks results
+                pass
             sc = self._num(str(int(m.score)), self.score_glyphs, h * 0.10)
             _blit(ov8, sc, cx, int(h * 0.30), "tc")
             pct = max(0.0, min(100.0, float(getattr(m, "accuracy", 0.0))))
@@ -264,4 +273,15 @@ class LegacyHud:
         ov = self._results
         a = (ov[..., 3:4].astype(np.float32) / 255.0) * max(0.0, min(1.0, op))
         out = rgb.astype(np.float32) * (1 - a) + ov[..., :3].astype(np.float32) * a
-        return np.clip(out, 0, 255).astype(np.uint8)
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        # flank leaderboard: composited per-frame at the results opacity (fades
+        # in with the cross-fade). Only when a board was attached; fail-soft.
+        if getattr(self, "board", None) is not None:
+            try:
+                from .lb_cards import draw_board
+                pim = Image.fromarray(out, "RGB").convert("RGBA")
+                draw_board(pim, self.board, max(0.0, min(1.0, op)))
+                out = np.asarray(pim.convert("RGB"))
+            except Exception:  # noqa: BLE001 — leaderboard never breaks a render
+                pass
+        return out

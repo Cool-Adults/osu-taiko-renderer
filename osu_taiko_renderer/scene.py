@@ -23,6 +23,25 @@ from .replay import hit_events
 
 GREAT, OK, MISS = "great", "ok", "miss"
 
+# osu!lazer ScoreV3 total-score mod multipliers — ppy/osu#37967 (mode-agnostic;
+# identical table to the std/catch/mania engines). Rate mods (DT/HT) at the
+# standard rate; unlisted mods -> 1.0. Keyed by the osu! mod bit.
+_MOD_SCORE_MULT = {
+    1 << 1: 0.80, 1 << 3: 1.04, 1 << 4: 1.09, 1 << 6: 1.23,
+    1 << 8: 0.55, 1 << 9: 1.23, 1 << 10: 1.20, 1 << 12: 0.95,
+}
+
+
+def mods_score_multiplier(mods: int) -> float:
+    mods = int(mods or 0)
+    if mods & (1 << 9):        # NC stored as DT|NC — count the speed mult once
+        mods &= ~(1 << 6)
+    m = 1.0
+    for bit, mult in _MOD_SCORE_MULT.items():
+        if mods & bit:
+            m *= mult
+    return m
+
 
 class TaikoSim:
     def __init__(self, bm, frames, cfg, *, skin=None, has_bg=False, meta=None):
@@ -263,10 +282,27 @@ class TaikoSim:
             cprog = combo_portion / max_combo_portion if max_combo_portion else 1.0
             aprog = judged / n if n else 1.0
             raw.append(500000.0 * acc * cprog + 500000.0 * (acc ** 5) * aprog)
-        hdr = int(getattr(self.meta, "score", 0) or 0)
-        if raw and raw[-1] > 0 and hdr > 0:
-            k = hdr / raw[-1]
-            self._scorev2 = [int(round(r * k)) for r in raw]
+        # ScoreV3 × mod multiplier (ppy/osu#37967). Previously the standardised
+        # curve was scaled to the .osr's authoritative score, which carried
+        # osu's OLD mod multiplier and made taiko inconsistent with the other
+        # modes. Now the curve is scaled by the NEW mod multiplier — unified
+        # across engines. (Trade-off: drops the drumroll/swell tick bonus the
+        # .osr scaling used to absorb; same class of simplification std makes.)
+        _mm = mods_score_multiplier(int(getattr(self.meta, "mods", 0) or 0))
+        _m = self.meta
+        _tot = ((getattr(_m, "count_300", 0) or 0) + (getattr(_m, "count_100", 0) or 0)
+                + (getattr(_m, "count_miss", 0) or 0)) if _m is not None else 0
+        if raw and _m is not None and _tot != len(order) and getattr(_m, "score", 0) and raw[-1] > 0:
+            # Judgment reconciliation FELL BACK: replay hit-count (_tot) != sim
+            # note count (an off-by-one in note parsing, ~2.5% of plays). The
+            # per-note judging is then UNRELIABLE, so raw*mult renders a wrong
+            # score (e.g. 351k for a 99.3% play). Anchor the curve to the
+            # replay's authoritative score instead (the pre-ScoreV3 behavior) so
+            # these plays are no worse than before the unification.
+            _k = _m.score / raw[-1]
+            self._scorev2 = [int(round(r * _k)) for r in raw]
+        elif raw:
+            self._scorev2 = [int(round(r * _mm)) for r in raw]
         else:
             self._scorev2 = [c[4] for c in self._cum]   # fallback: internal sum
 

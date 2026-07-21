@@ -145,6 +145,17 @@ class RenderConfig:
     # intro R3D "R" splash (parity with std/catch show_logo; off by default so
     # existing renders are unchanged)
     show_logo: bool = False
+    # results-screen map leaderboard (parity with std/catch): the featured play
+    # flanked by compact ranked cards of the OTHER renders of this map. Default
+    # source = the local render DB; "osu" reads the bot-written osu! global
+    # scores JSON (falls back to the DB when absent). Default-on but a no-op when
+    # the map has no other renders, so existing renders are unchanged.
+    show_leaderboard: bool = True
+    leaderboard_source: str = "r3d"      # r3d | osu
+    leaderboard_json: Path | None = None
+    # FEATURED results-card avatar: the current player's REAL osu! avatar PNG
+    # (service passes it). None -> the engine draws the procedural username chip.
+    featured_avatar_png: Path | None = None
 
 
 @dataclass

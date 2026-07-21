@@ -55,6 +55,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--logo", action=BA, default=False,
                     help="show_logo: the R3D 'R' tile splash during the intro, "
                          "fading out as gameplay starts (parity with std/catch)")
+    ap.add_argument("--leaderboard", action=BA, default=True,
+                    help="per-map render leaderboard on the results screen "
+                         "(featured play flanked by other renders of the same "
+                         "map, from the local render DB); default on")
+    ap.add_argument("--leaderboard-source", choices=("r3d", "osu"),
+                    default="r3d",
+                    help="flank-card source: 'r3d' = the local render DB "
+                         "(default), 'osu' = the map's osu! GLOBAL top scores "
+                         "from --leaderboard-json (silently falls back to r3d "
+                         "when that file is missing/empty/invalid)")
+    ap.add_argument("--leaderboard-json", type=Path, default=None,
+                    help="path to the bot-written osu! global scores JSON "
+                         "(only read when --leaderboard-source osu)")
+    ap.add_argument("--featured-avatar-png", type=Path, default=None,
+                    help="PNG of the FEATURED player's REAL osu! avatar for the "
+                         "results CENTRE card (service passes the player's osu! "
+                         "pfp). Absent -> the procedural username chip.")
     # Accept-and-ignore: lets the shared render pipeline pass mode-agnostic
     # flags it also sends to the catch renderer without erroring here.
     args, _unknown = ap.parse_known_args(argv)
@@ -86,9 +103,23 @@ def main(argv: list[str] | None = None) -> int:
         show_grade=args.show_grade,
         show_mods=args.show_mods,
         show_logo=args.logo,
+        show_leaderboard=args.leaderboard,
+        leaderboard_source=args.leaderboard_source,
+        leaderboard_json=args.leaderboard_json,
+        featured_avatar_png=args.featured_avatar_png,
     )
     if args.results_seconds is not None:
         cfg.results_ms = int(args.results_seconds * 1000)
+
+    # Hand the FEATURED player's osu! avatar PNG to the results screen (the
+    # ported lazer results reads it via a module global). Missing/unreadable
+    # leaves the featured card on the procedural username chip.
+    if args.featured_avatar_png is not None:
+        try:
+            from . import lazer_results as _lr
+            _lr.set_featured_avatar_png(args.featured_avatar_png)
+        except Exception:  # noqa: BLE001 — avatar wiring never breaks a render
+            pass
 
     def progress(pct: int) -> None:
         print(f"\rrendering… {pct:3d}%", end="", file=sys.stderr, flush=True)
