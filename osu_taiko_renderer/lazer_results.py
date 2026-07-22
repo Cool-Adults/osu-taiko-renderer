@@ -939,6 +939,8 @@ class CatchLazerResults:
         self._score_img = None
         self._score_val = -1
         self._osu_path = osu_path
+        self._black_base = None            # cached opaque-black RGBA base (perf)
+        self._panel_wcache: dict = {}      # stats-panel unfold resize per width (perf)
 
         # --- results data (the replay's authoritative taiko counts) ---------
         great = int(getattr(meta, "count_300", 0) or 0)   # taiko GREAT
@@ -1194,15 +1196,32 @@ class CatchLazerResults:
         op = _clamp01(opacity)
         if age_ms is None:                 # back-compat: no timeline → settled
             age_ms = SETTLE_MS if op >= 0.999 else op * FADE_MS
-        settled = op >= 0.999 and age_ms >= SETTLE_MS
+        # perf: every animation (all eases clamp to 1.0) is exactly at rest
+        # once the LAST stats panel finishes unfolding — frames from that
+        # moment on are pixel-identical, so start the settled-frame cache
+        # there instead of waiting for SETTLE_MS.
+        anim_done_ms = min(SETTLE_MS,
+                           STAGE1_MS + 120.0 + 2 * STAGGER_MS + OPEN_MS)
+        settled = op >= 0.999 and age_ms >= anim_done_ms
         if settled and self._settled is not None:
             return self._settled
 
-        base = Image.fromarray(rgb, "RGB").convert("RGBA")
-        # BLACK background: std's scene has faded to black by results_start
-        # and the screen dims what's left — the results sit on clean black.
-        base = Image.alpha_composite(
-            base, Image.new("RGBA", base.size, (0, 0, 0, int(op * 255))))
+        wash_a = int(op * 255)
+        if wash_a >= 255:
+            # perf: a fully-opaque wash makes the underlying frame irrelevant —
+            # the composite below produced exactly (0,0,0,255) everywhere. Skip
+            # the fromarray/convert/alpha_composite round-trip (this is every
+            # frame past the 400ms fade) and start from cached opaque black.
+            if self._black_base is None:
+                self._black_base = Image.new(
+                    "RGBA", (rgb.shape[1], rgb.shape[0]), (0, 0, 0, 255))
+            base = self._black_base.copy()
+        else:
+            base = Image.fromarray(rgb, "RGB").convert("RGBA")
+            # BLACK background: std's scene has faded to black by results_start
+            # and the screen dims what's left — the results sit on clean black.
+            base = Image.alpha_composite(
+                base, Image.new("RGBA", base.size, (0, 0, 0, wash_a)))
 
         fade = _clamp01(age_ms / FADE_MS) * op
         if fade > 0.003:
@@ -1399,8 +1418,17 @@ class CatchLazerResults:
             left = self.STATS_X0 * k
             pw, ph = self.stats_panel_img.size
             drawn_w = max(int(pw * s), 1)
-            img = self.stats_panel_img if drawn_w >= pw else \
-                self.stats_panel_img.resize((drawn_w, ph), Image.BILINEAR)
+            if drawn_w >= pw:
+                img = self.stats_panel_img
+            else:
+                # perf: cache the width-squashed bg per integer width (the
+                # three staggered panels re-hit the same widths); identical
+                # resize call → identical pixels.
+                img = self._panel_wcache.get(drawn_w)
+                if img is None:
+                    img = self.stats_panel_img.resize((drawn_w, ph),
+                                                      Image.BILINEAR)
+                    self._panel_wcache[drawn_w] = img
             _paste(base, img, left + drawn_w / 2.0, pcy,
                    min(s * 1.3, 1.0) * op)
             content_a = _clamp01((s - 0.55) / 0.45) * op

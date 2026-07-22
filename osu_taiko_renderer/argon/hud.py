@@ -46,6 +46,44 @@ def _fillband(rgb, x0, x1, y, h, color, alpha):
     rgb[y:y + h, x0:x1] = np.clip(seg, 0, 255).astype(np.uint8)
 
 
+# perf: per-texture cache of the float32 conversion + alpha terms used by
+# _blit. The HUD composites the same (font/counter-cached) RGBA arrays every
+# frame; precomputing `1-a` and `rgb*a` once per texture halves the per-blit
+# math while producing bit-identical results (same float32 ops, elementwise —
+# cropping commutes with them). id() keys are safe because the cache keeps a
+# strong ref to the source (id can't be reused while cached); hard-clear bound.
+_PM_CACHE: dict = {}
+_PM_CACHE_MAX = 1024
+
+
+def _pm_terms(src):
+    """(1-a, rgb*a, oy, ox) of `src`, cropped to the tight alpha>0 bounding
+    box (blending where a==0 is an exact float no-op: x*1.0 + s*0.0 == x, so
+    skipping those pixels is bit-identical — font/wedge textures carry large
+    transparent pads). None = fully transparent (nothing to composite)."""
+    key = id(src)
+    hit = _PM_CACHE.get(key)
+    if hit is not None and hit[0] is src:
+        return hit[1]
+    mask = src[..., 3] != 0
+    rows = mask.any(axis=1)
+    if not rows.any():
+        terms = None
+    else:
+        cols = mask.any(axis=0)
+        y0 = int(np.argmax(rows))
+        y1 = len(rows) - int(np.argmax(rows[::-1]))
+        x0 = int(np.argmax(cols))
+        x1 = len(cols) - int(np.argmax(cols[::-1]))
+        s = src[y0:y1, x0:x1].astype(np.float32)
+        a = s[..., 3:4] / 255.0
+        terms = (1 - a, s[..., :3] * a, y0, x0)
+    if len(_PM_CACHE) > _PM_CACHE_MAX:
+        _PM_CACHE.clear()
+    _PM_CACHE[key] = (src, terms)
+    return terms
+
+
 def _blit(rgb, src, x, y, anchor="tl"):
     """Alpha-composite RGBA uint8 `src` onto RGB uint8 `rgb`. anchor picks the
     reference corner: tl, tr, bl, br, tc, bc, cc."""
@@ -57,15 +95,23 @@ def _blit(rgb, src, x, y, anchor="tl"):
     if "b" in anchor:
         y -= h
     x, y = int(round(x)), int(round(y))
+    terms = _pm_terms(src)
+    if terms is None:
+        return
+    inv, sa, oy, ox = terms
+    # shift to the cropped rect (anchoring above used the FULL src shape,
+    # exactly as before)
+    x += ox
+    y += oy
+    h, w = inv.shape[:2]
     H, W = rgb.shape[:2]
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(W, x + w), min(H, y + h)
     if x1 <= x0 or y1 <= y0:
         return
-    s = src[y0 - y:y1 - y, x0 - x:x1 - x].astype(np.float32)
-    a = s[..., 3:4] / 255.0
+    crop = (slice(y0 - y, y1 - y), slice(x0 - x, x1 - x))
     region = rgb[y0:y1, x0:x1].astype(np.float32)
-    region = region * (1 - a) + s[..., :3] * a
+    region = region * inv[crop] + sa[crop]
     rgb[y0:y1, x0:x1] = np.clip(region, 0, 255).astype(np.uint8)
 
 
@@ -101,7 +147,8 @@ class ArgonHud:
         return out
 
     def overlay(self, rgb: np.ndarray, scene) -> np.ndarray:
-        rgb = np.ascontiguousarray(rgb)
+        # rgb is mutated in place (writable flipped view from the PBO pop) —
+        # the old full-frame ascontiguousarray copy was pure render-thread cost.
         w, h, t = self.w, self.h, scene.time_ms
         mx, my = int(w * 0.018), int(h * 0.03)
         lab_px = max(11, int(h * 0.016))

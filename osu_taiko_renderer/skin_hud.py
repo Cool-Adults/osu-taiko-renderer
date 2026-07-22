@@ -62,6 +62,7 @@ class LegacyHud:
             if c is not None:
                 self.sb_frames = [c]
         self._gcache: dict = {}      # scaled glyph per (font, char, px)
+        self._ncache: dict = {}      # assembled digit-string per (font, text, px)
         self._bg_scaled = None       # scaled scorebar-bg (cached once)
         self._col_base = None        # scaled scorebar-colour at full bar width
         self._results = None
@@ -103,6 +104,20 @@ class LegacyHud:
         return im
 
     def _num(self, text, glyphs, px, overlap_frac=0.0):
+        # perf: cache the ASSEMBLED string image (score/acc/combo strings
+        # repeat heavily across frames); identical inputs assemble the exact
+        # same array, so this only skips recomputation.
+        nkey = (id(glyphs), text, round(px), overlap_frac)
+        hit = self._ncache.get(nkey)
+        if hit is not None:
+            return hit
+        out = self._num_build(text, glyphs, px, overlap_frac)
+        if len(self._ncache) > 4096:
+            self._ncache.clear()
+        self._ncache[nkey] = out
+        return out
+
+    def _num_build(self, text, glyphs, px, overlap_frac=0.0):
         ref = glyphs.get("0")
         if ref is None:
             return np.zeros((1, 1, 4), np.uint8)
@@ -121,7 +136,8 @@ class LegacyHud:
         return out
 
     def overlay(self, rgb, scene):
-        rgb = np.ascontiguousarray(rgb)
+        # rgb is mutated in place (writable flipped view from the PBO pop) —
+        # the old full-frame ascontiguousarray copy was pure render-thread cost.
         w, h = self.w, self.h
         mx, my = int(w * 0.012), int(h * 0.02)
         # HP bar (scorebar-bg + colour frame by hp), top-left

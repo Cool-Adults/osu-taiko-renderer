@@ -70,7 +70,14 @@ class _FrameWriter:
             if self._werr is not None:
                 continue          # drain (never write after an error)
             try:
-                data = frame.tobytes()
+                # perf: a C-contiguous frame (outro frames, repeated frozen
+                # frames) is written zero-copy via its buffer; only flipped
+                # gameplay views need the tobytes() flip copy. Bytes on the
+                # pipe are identical either way.
+                if frame.flags.c_contiguous:
+                    data = memoryview(frame).cast("B")
+                else:
+                    data = frame.tobytes()
                 if self._hash is not None:
                     self._hash.update(data)
                     self._hash_frames += 1
@@ -330,10 +337,17 @@ def render_core(
                     # ordering is preserved across the boundary.
                     for raw in renderer.read_drain():
                         _emit_gameplay(raw)
+                    # perf: materialise the frozen final gameplay frame ONCE
+                    # (it was .copy()'d per outro frame). Nothing downstream
+                    # mutates it — the results screen builds new arrays — so
+                    # re-pushing the same array is byte-identical.
+                    if last_gameplay is not None and \
+                            not last_gameplay.flags.c_contiguous:
+                        last_gameplay = np.ascontiguousarray(last_gameplay)
                     # outro: frozen final gameplay frame, then the results card
                     # fades in (consistent with the mania renderer). Real-time.
                     t = int(gameplay_end_ms + (i - gameplay_frames) * frame_ms)
-                    rgb = last_gameplay.copy() if last_gameplay is not None else \
+                    rgb = last_gameplay if last_gameplay is not None else \
                         renderer.read_rgb()
                     if cfg.show_results and t >= results_start_ms:
                         op = min(1.0, (t - results_start_ms) / FADE_MS)

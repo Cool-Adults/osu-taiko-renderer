@@ -84,9 +84,50 @@ class SpriteRenderer:
             self.prog, [(self.vbo, "2f 2f", "in_pos", "in_uv")],
         )
         self.prog["u_screen"].value = (float(width), float(height))
+        # perf: cache the uniform objects once (prog["..."] is a dict lookup +
+        # object construction per access — it was per-sprite in draw()) and
+        # bind the sampler slot a single time.
+        self.prog["u_tex"].value = 0
+        self._u_color = self.prog["u_color"]
+        self._u_center = self.prog["u_center"]
+        self._u_size = self.prog["u_size"]
+        self._u_rot = self.prog["u_rot"]
 
-        rb = self.ctx.renderbuffer((width, height))
-        self.fbo = self.ctx.framebuffer(color_attachments=[rb])
+        # Scene target is a TEXTURE (was a renderbuffer) so the flip pass can
+        # sample it; RGBA8 rasterization into either is identical.
+        self._scene_tex = self.ctx.texture((width, height), 4)
+        self._scene_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
+        # perf: y-flip on the GPU. The CPU used to hand ffmpeg a np.flipud view
+        # whose flip copy ran per frame (writer-thread tobytes). Instead an
+        # exact texelFetch pass mirrors the scene into a second FBO, so the
+        # PBO readback is already top-left origin and fully contiguous —
+        # written to the pipe zero-copy. texelFetch is an integer texel copy
+        # (no filtering/blending): bytes are identical to the CPU flip.
+        self._flip_prog = self.ctx.program(
+            vertex_shader="""
+                #version 330
+                in vec2 in_pos;
+                void main() { gl_Position = vec4(in_pos * 2.0, 0.0, 1.0); }
+            """,
+            fragment_shader="""
+                #version 330
+                uniform sampler2D u_tex;
+                out vec4 f_color;
+                void main() {
+                    ivec2 sz = textureSize(u_tex, 0);
+                    f_color = texelFetch(u_tex,
+                        ivec2(int(gl_FragCoord.x),
+                              sz.y - 1 - int(gl_FragCoord.y)), 0);
+                }
+            """,
+        )
+        self._flip_prog["u_tex"].value = 0
+        self._flip_vao = self.ctx.vertex_array(
+            self._flip_prog, [(self.vbo, "2f 2x4", "in_pos")],
+        )
+        rb_flip = self.ctx.renderbuffer((width, height))
+        self._flip_fbo = self.ctx.framebuffer(color_attachments=[rb_flip])
         self._textures: dict[str, moderngl.Texture] = {}
         self._white = self._make_texture_rgba(np.full((1, 1, 4), 255, dtype="u1"))
 
@@ -124,17 +165,28 @@ class SpriteRenderer:
         self.ctx.clear(*clear)
 
     def draw(self, sprites: list[Sprite]) -> None:
+        # perf: hoisted locals + cached uniform objects + redundant-bind skip.
+        # Per-draw GL state is identical to the old loop, so output is
+        # unchanged; only the Python-side overhead per sprite shrinks.
+        textures = self._textures
+        white = self._white
+        u_color, u_center = self._u_color, self._u_center
+        u_size, u_rot = self._u_size, self._u_rot
+        render = self.vao.render
+        strip = moderngl.TRIANGLE_STRIP
+        prev_tex = None
         for sp in sprites:
-            tex = self._textures.get(sp.texture_key) if sp.texture_key else self._white
+            tex = textures.get(sp.texture_key) if sp.texture_key else white
             if tex is None:
-                tex = self._white
-            tex.use(location=0)
-            self.prog["u_tex"].value = 0
-            self.prog["u_color"].value = sp.color
-            self.prog["u_center"].value = (sp.x, sp.y)
-            self.prog["u_size"].value = (sp.w, sp.h)
-            self.prog["u_rot"].value = sp.rotation
-            self.vao.render(moderngl.TRIANGLE_STRIP)
+                tex = white
+            if tex is not prev_tex:
+                tex.use(location=0)
+                prev_tex = tex
+            u_color.value = sp.color
+            u_center.value = (sp.x, sp.y)
+            u_size.value = (sp.w, sp.h)
+            u_rot.value = sp.rotation
+            render(strip)
 
     _PBO_RING = 3
 
@@ -150,8 +202,16 @@ class SpriteRenderer:
             size = self.width * self.height * 3
             self._pbos = [self.ctx.buffer(reserve=size)
                           for _ in range(self._PBO_RING)]
+        # GPU y-flip pass: mirror the scene into _flip_fbo (exact texel copy,
+        # blending off), then queue the async read from THAT — the PBO then
+        # holds top-left-origin rows directly.
+        self.ctx.disable(moderngl.BLEND)
+        self._flip_fbo.use()
+        self._scene_tex.use(location=0)
+        self._flip_vao.render(moderngl.TRIANGLE_STRIP)
+        self.ctx.enable(moderngl.BLEND)
         buf = self._pbos[self._pbo_head % len(self._pbos)]
-        self.fbo.read_into(buf, components=3, alignment=1)
+        self._flip_fbo.read_into(buf, components=3, alignment=1)
         self._pbo_head += 1
         if self._pbo_head - self._pbo_tail < len(self._pbos):
             return None
@@ -160,10 +220,13 @@ class SpriteRenderer:
     def _pop_pbo(self) -> np.ndarray:
         buf = self._pbos[self._pbo_tail % len(self._pbos)]
         self._pbo_tail += 1
-        data = buf.read()
-        arr = np.frombuffer(data, dtype="u1").reshape(
-            (self.height, self.width, 3))
-        return np.flipud(arr)  # same orientation contract as read_rgb
+        # read straight into a fresh WRITABLE, CONTIGUOUS array (perf: skips
+        # the bytes allocation of buf.read(); rows are already top-left origin
+        # thanks to the GPU flip pass, so the compositors mutate it in place
+        # and the writer thread pipes it zero-copy; byte stream unchanged).
+        arr = np.empty((self.height, self.width, 3), dtype="u1")
+        buf.read_into(arr)
+        return arr
 
     def read_drain(self) -> list:
         """Return every frame still in flight, oldest first (map end or

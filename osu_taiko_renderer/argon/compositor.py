@@ -13,28 +13,71 @@ from .textures import bake_drum_flash, bake_explosion, bake_ring
 _JUDGE_TEXT = {"great": "GREAT", "ok": "OK", "miss": "MISS"}
 _JUDGE_COL = {"great": C.JUDGE_GREAT, "ok": C.JUDGE_OK, "miss": C.JUDGE_MISS}
 
+# perf: per-(texture, size[, tint]) caches of the resize + float32 conversion
+# work that used to run per active popup per frame. The cached arrays hold the
+# exact same values the inline computation produced (same resize filter, same
+# op order), so the composited output is bit-identical — only recomputation is
+# skipped. id() keys are safe because the cache keeps a strong ref to the
+# source array (its id can't be reused while cached); bounded by a hard clear.
+_SCALE_CACHE: dict = {}     # (id(tex), tw, th, tint) -> (tex, src_rgb, a01, oy, ox)
+_SCALE_CACHE_MAX = 256
+
+
+def _scaled_f32(tex, tw, th, tint=None):
+    """(src_rgb float32 [tinted], alpha/255 float32, oy, ox) of `tex` resized
+    to tw×th — cached, cropped to the tight alpha>0 bounding box (compositing
+    where a==0 is an exact float no-op, so skipping those pixels is
+    bit-identical). Values match the previous per-call computation exactly.
+    Returns None when the resized texture is fully transparent."""
+    key = (id(tex), tw, th, tint)
+    hit = _SCALE_CACHE.get(key)
+    if hit is not None and hit[0] is tex:
+        return hit[1]
+    # BILINEAR (not LANCZOS): this runs per active popup per frame and the
+    # textures are soft glows/text — the quality difference is invisible, the
+    # speedup is ~3x. (One-time bakes stay LANCZOS.)
+    im8 = np.asarray(Image.fromarray(tex).resize((tw, th), Image.BILINEAR))
+    mask = im8[..., 3] != 0
+    rows = mask.any(axis=1)
+    if not rows.any():
+        entry = None
+    else:
+        cols = mask.any(axis=0)
+        y0 = int(np.argmax(rows))
+        y1 = len(rows) - int(np.argmax(rows[::-1]))
+        x0 = int(np.argmax(cols))
+        x1 = len(cols) - int(np.argmax(cols[::-1]))
+        im = im8[y0:y1, x0:x1].astype(np.float32)
+        src_rgb, a01 = im[..., :3], im[..., 3:4] / 255.0
+        if tint is not None and tint != (1.0, 1.0, 1.0):
+            src_rgb = src_rgb * np.asarray(tint, dtype=np.float32)
+        entry = (src_rgb, a01, y0, x0)
+    if len(_SCALE_CACHE) > _SCALE_CACHE_MAX:
+        _SCALE_CACHE.clear()
+    _SCALE_CACHE[key] = (tex, entry)
+    return entry
+
 
 def _add_tex(rgb, tex, cx, cy, tw, th, intensity, tint=(1.0, 1.0, 1.0)):
     """Additive-blend RGBA `tex` (resized to tw×th) centred at (cx,cy)."""
     tw, th = int(round(tw)), int(round(th))
     if tw < 1 or th < 1 or intensity <= 0:
         return
-    # BILINEAR (not LANCZOS): this runs per active popup per frame and the
-    # textures are soft glows/text — the quality difference is invisible, the
-    # speedup is ~3x. (One-time bakes stay LANCZOS.)
-    im = np.asarray(Image.fromarray(tex).resize((tw, th), Image.BILINEAR)).astype(np.float32)
-    src_rgb, src_a = im[..., :3], (im[..., 3:4] / 255.0) * intensity
-    if tint != (1.0, 1.0, 1.0):
-        src_rgb = src_rgb * np.asarray(tint, dtype=np.float32)
+    entry = _scaled_f32(tex, tw, th, tint)
+    if entry is None:
+        return
+    src_rgb, a01, oy, ox = entry
+    ch, cw = src_rgb.shape[:2]
     H, W = rgb.shape[:2]
-    x0, y0 = int(round(cx - tw / 2)), int(round(cy - th / 2))
+    # top-left of the FULL resized tex (as before), then the crop offset
+    x0, y0 = int(round(cx - tw / 2)) + ox, int(round(cy - th / 2)) + oy
     sx0, sy0 = max(0, -x0), max(0, -y0)
     dx0, dy0 = max(0, x0), max(0, y0)
-    dx1, dy1 = min(W, x0 + tw), min(H, y0 + th)
+    dx1, dy1 = min(W, x0 + cw), min(H, y0 + ch)
     if dx1 <= dx0 or dy1 <= dy0:
         return
     h, w = dy1 - dy0, dx1 - dx0
-    sa = src_a[sy0:sy0 + h, sx0:sx0 + w]
+    sa = a01[sy0:sy0 + h, sx0:sx0 + w] * intensity
     sc = src_rgb[sy0:sy0 + h, sx0:sx0 + w]
     region = rgb[dy0:dy1, dx0:dx1].astype(np.float32) + sc * sa
     rgb[dy0:dy1, dx0:dx1] = np.clip(region, 0, 255).astype(np.uint8)
@@ -65,36 +108,63 @@ def _blit_straight(rgb, tex, cx, cy, tw, th, alpha):
     tw, th = int(round(tw)), int(round(th))
     if tw < 1 or th < 1 or alpha <= 0:
         return
-    im = np.asarray(Image.fromarray(tex).resize((tw, th), Image.BILINEAR)).astype(np.float32)
-    src_rgb, src_a = im[..., :3], (im[..., 3:4] / 255.0) * alpha
+    entry = _scaled_f32(tex, tw, th)
+    if entry is None:
+        return
+    src_rgb, a01, oy, ox = entry
+    ch, cw = src_rgb.shape[:2]
     H, W = rgb.shape[:2]
-    x0, y0 = int(round(cx - tw / 2)), int(round(cy - th / 2))
+    x0, y0 = int(round(cx - tw / 2)) + ox, int(round(cy - th / 2)) + oy
     sx0, sy0 = max(0, -x0), max(0, -y0)
     dx0, dy0 = max(0, x0), max(0, y0)
-    dx1, dy1 = min(W, x0 + tw), min(H, y0 + th)
+    dx1, dy1 = min(W, x0 + cw), min(H, y0 + ch)
     if dx1 <= dx0 or dy1 <= dy0:
         return
     h, w = dy1 - dy0, dx1 - dx0
-    sa = src_a[sy0:sy0 + h, sx0:sx0 + w]
+    sa = a01[sy0:sy0 + h, sx0:sx0 + w] * alpha
     sc = src_rgb[sy0:sy0 + h, sx0:sx0 + w]
     region = rgb[dy0:dy1, dx0:dx1].astype(np.float32)
     region = region * (1 - sa) + sc * sa
     rgb[dy0:dy1, dx0:dx1] = np.clip(region, 0, 255).astype(np.uint8)
 
 
-def _add_prescaled(rgb, im, cx, cy, intensity):
-    """Additive-blend an already-float32 RGBA texture (no resize) centred at (cx,cy)."""
-    th, tw = im.shape[:2]
+def _prebake_add(im8):
+    """(rgb f32, alpha/255 f32, oy, ox, full_h, full_w) of an RGBA uint8
+    texture, cropped to the tight alpha>0 bbox (additive blend where a==0
+    adds exactly +0.0 — skipping is bit-identical). None = fully transparent."""
+    mask = im8[..., 3] != 0
+    rows = mask.any(axis=1)
+    fh, fw = im8.shape[:2]
+    if not rows.any():
+        return None
+    cols = mask.any(axis=0)
+    y0 = int(np.argmax(rows))
+    y1 = fh - int(np.argmax(rows[::-1]))
+    x0 = int(np.argmax(cols))
+    x1 = fw - int(np.argmax(cols[::-1]))
+    im = im8[y0:y1, x0:x1].astype(np.float32)
+    return (im[..., :3], im[..., 3:4] / 255.0, y0, x0, fh, fw)
+
+
+def _add_prescaled(rgb, pre, cx, cy, intensity):
+    """Additive-blend a prescaled texture centred at (cx,cy). `pre` is the
+    _prebake_add tuple — the float32 conversion + /255 normalisation used to
+    run per call per frame; values are identical."""
+    if pre is None:
+        return
+    sc_full, a01, oy, ox, fh, fw = pre
+    ch, cw = sc_full.shape[:2]
     H, W = rgb.shape[:2]
-    x0, y0 = int(round(cx - tw / 2)), int(round(cy - th / 2))
+    # top-left of the FULL texture (as before), then the crop offset
+    x0, y0 = int(round(cx - fw / 2)) + ox, int(round(cy - fh / 2)) + oy
     sx0, sy0 = max(0, -x0), max(0, -y0)
     dx0, dy0 = max(0, x0), max(0, y0)
-    dx1, dy1 = min(W, x0 + tw), min(H, y0 + th)
+    dx1, dy1 = min(W, x0 + cw), min(H, y0 + ch)
     if dx1 <= dx0 or dy1 <= dy0:
         return
     h, w = dy1 - dy0, dx1 - dx0
-    sa = (im[sy0:sy0 + h, sx0:sx0 + w, 3:4] / 255.0) * intensity
-    sc = im[sy0:sy0 + h, sx0:sx0 + w, :3]
+    sa = a01[sy0:sy0 + h, sx0:sx0 + w] * intensity
+    sc = sc_full[sy0:sy0 + h, sx0:sx0 + w]
     region = rgb[dy0:dy1, dx0:dx1].astype(np.float32) + sc * sa
     rgb[dy0:dy1, dx0:dx1] = np.clip(region, 0, 255).astype(np.uint8)
 
@@ -109,6 +179,7 @@ class ArgonEffects:
         self._ring = bake_ring(64, 8)   # white judgement RingExplosion ring
         self.font = get_font("SemiBold")
         self._jcache: dict[str, np.ndarray] = {}
+        self._rng_cache: dict = {}      # (rt, piece, travel) -> (angle, dist)
         # Skin judgement images (taiko-hit300/100/0) — used for the gameplay
         # popups instead of Torus text when the skin provides them.
         from ..taiko_skin import TaikoSkin
@@ -121,22 +192,25 @@ class ArgonEffects:
                 self._skin_judge[res] = img
         self._use_skin_judge = "great" in self._skin_judge
         # Pre-scale explosion textures to the two note sizes (resizing every
-        # frame per active explosion was a render-time hotspot).
+        # frame per active explosion was a render-time hotspot). Stored as
+        # _prebake_add tuples (float32 rgb + alpha/255, alpha-bbox-cropped) so
+        # the per-frame additive blend skips the per-call /255 normalisation
+        # and all fully-transparent margins (identical values either way).
         self._exp_scaled = {}
         for is_rim in (False, True):
             for big in (False, True):
                 d = int(round(geo.big_d if big else geo.note_d))
-                im = np.asarray(Image.fromarray(self.exp[is_rim])
-                                .resize((d, d), Image.LANCZOS)).astype(np.float32)
-                self._exp_scaled[(is_rim, big)] = im
+                im8 = np.asarray(Image.fromarray(self.exp[is_rim])
+                                 .resize((d, d), Image.LANCZOS))
+                self._exp_scaled[(is_rim, big)] = _prebake_add(im8)
         # Pre-scale the 4 drum-flash quadrants to the drum size.
         dd = int(round(geo.drum_d))
         self._drum_scaled = {}
         for is_rim in (False, True):
             for left in (True, False):
-                im = np.asarray(Image.fromarray(bake_drum_flash(ring=is_rim, left=left))
-                                .resize((dd, dd), Image.LANCZOS)).astype(np.float32)
-                self._drum_scaled[(is_rim, left)] = im
+                im8 = np.asarray(Image.fromarray(bake_drum_flash(ring=is_rim, left=left))
+                                 .resize((dd, dd), Image.LANCZOS))
+                self._drum_scaled[(is_rim, left)] = _prebake_add(im8)
 
     def _judge_tex(self, result):
         if result not in self._jcache:
@@ -177,15 +251,28 @@ class ArgonEffects:
         rad = 0.6 + 0.4 * (1.0 - (1.0 - p) ** 5)
         pieces = [9.0 * sc] * n_small + [14.0 * sc] * n_large
         for i, size in enumerate(pieces):
-            rng = random.Random((int(rt) * 1000003) ^ (i * 2654435761))
-            d = rng.uniform(0.0, 360.0)
-            dist = rng.uniform(travel / 2.0, travel)
+            # perf: the seeded draws depend only on (rt, i, travel) — cache
+            # them across frames instead of constructing a fresh
+            # random.Random per piece per frame (values identical).
+            rkey = (int(rt), i, travel)
+            hit = self._rng_cache.get(rkey)
+            if hit is None:
+                rng = random.Random((int(rt) * 1000003) ^ (i * 2654435761))
+                hit = (rng.uniform(0.0, 360.0),
+                       rng.uniform(travel / 2.0, travel))
+                if len(self._rng_cache) > 4096:
+                    self._rng_cache.clear()
+                self._rng_cache[rkey] = hit
+            d, dist = hit
             cur = dist * rad
             _add_tex(rgb, self._ring, g.target_x + math.cos(d) * cur,
                      g.center_y + math.sin(d) * cur, size, size, ga, tint=col)
 
     def composite(self, rgb, exps, judges, drums=()):
-        rgb = np.ascontiguousarray(rgb)
+        # rgb arrives as a writable (possibly flipped-view) frame from the PBO
+        # pop and is mutated region-by-region in place — the old full-frame
+        # ascontiguousarray copy ran on the render thread every frame and is
+        # exactly what the writer thread's tobytes() already pays for.
         g = self.geo
         # input-drum press flashes (additive — clean bright pop + glow)
         for is_rim, left, a in drums:
