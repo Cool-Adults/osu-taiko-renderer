@@ -251,6 +251,17 @@ def render_core(
         hud = _lh
     else:
         hud = ArgonHud(cfg.resolution, meta, bm, first, last, sim, cfg=cfg)
+    # lazer's BreakOverlay (countdown + progress bar + CURRENT PROGRESS info
+    # + slide-in chevrons) — break_overlay.py, a 1:1 port of
+    # osu.Game/Screens/Play/BreakOverlay.cs on this engine's CPU compositing
+    # (the catch d8ccb60 rollout). lazer taiko shows the same screen-centre
+    # overlay (a Player-level component), so it is composited over the full
+    # frame on BOTH HUD variants from one wiring point in _emit_gameplay.
+    # Fed the same map-time [Events] breaks that drive the dim envelope.
+    from .break_overlay import LazerBreakOverlay
+    break_overlay = LazerBreakOverlay(
+        w, h, getattr(bm, "breaks", []) or [],
+        mods=int(getattr(meta, "mods", 0) or 0))
     from .argon.compositor import ArgonEffects, bloom as _bloom
     effects = ArgonEffects(sim.geo, cfg.skin_dir)
 
@@ -315,6 +326,12 @@ def render_core(
         p_scene, p_exps, p_judges, p_drums = pending.popleft()
         out = effects.composite(raw, p_exps, p_judges, p_drums)
         out = hud.overlay(out, p_scene)
+        # lazer z-order: BreakOverlay is a LATER overlay-component child
+        # than HUDOverlay (Player.createOverlayComponents) — composited
+        # ABOVE every HUD element, both HUD variants. Live accuracy from
+        # the sim's running scene value (bound like lazer's bindable).
+        # Cheap no-op outside break windows (frame bytes untouched).
+        break_overlay.draw(out, p_scene.time_ms, p_scene.accuracy)
         last_gameplay = out
         writer.push(out)
 
