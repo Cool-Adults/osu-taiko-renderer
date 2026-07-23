@@ -425,6 +425,21 @@ def _ffmpeg_has(name: str) -> bool:
     return name in out
 
 
+def nvenc_target_bps(w: int, h: int, fps: float) -> int:
+    """Resolution-scaled NVENC bitrate ladder (R3D cross-engine policy, 2026-07).
+
+    Replaces the flat per-engine bitrate: scale a 4 Mbps 720p30 reference
+    by pixel rate with a perceptual exponent (0.70 -- deliberately NOT
+    linear), clamped to [2.5, 16] Mbps.  Anchors: 720p30=4.0M,
+    720p60=6.5M, 1080p30=7.1M, 1080p60=11.5M, 1440p60/1080p120+=16M cap.
+    Callers pair the target with maxrate=1.5x / bufsize=2x for NVENC VBR.
+    Same formula in all four engines (catch/taiko/std/mania v2).
+    """
+    ref = 1280.0 * 720.0 * 30.0
+    target = 4_000_000.0 * ((float(w) * float(h) * float(fps)) / ref) ** 0.70
+    return int(min(16_000_000.0, max(2_500_000.0, target)))
+
+
 def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                   start_ms: int, rate: float = 1.0, total_dur_s: float | None = None):
     w, h = cfg.resolution
@@ -441,7 +456,12 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
     if enc == "h264_vaapi":
         cmd += ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-b:v", "8M"]
     elif enc == "h264_nvenc":
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p", "-b:v", "8M"]
+        # Resolution-scaled bitrate ladder (was flat 8M) -- R3D cross-engine
+        # NVENC policy; see nvenc_target_bps above.
+        _tgt = nvenc_target_bps(w, h, cfg.fps)
+        cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p",
+                "-b:v", str(_tgt), "-maxrate", str(int(_tgt * 1.5)),
+                "-bufsize", str(_tgt * 2)]
     else:
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "20"]
 
