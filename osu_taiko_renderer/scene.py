@@ -1,9 +1,15 @@
 """Taiko simulation + per-frame scene builder.
 
-Judges the replay against the map (greedy don/kat matching inside the OD hit
-windows -> GREAT/OK/MISS, with combo/score/accuracy/HP), then for any frame
-time builds the right->left scrolling scene: hit target, don/kat notes,
-drumroll bodies, swells, and hit explosions.
+Judges the replay against the map with a faithful in-order taiko sim (each
+key-press consumes the FRONTMOST still-hittable same-colour note inside the OD
+hit window — notelock, no press-stealing; a note whose OK window passes unhit
+is a MISS), giving GREAT/OK/MISS placement that lands combo breaks on the notes
+the player actually missed. The .osr header stays the count-authority: a
+reconcile pass snaps the great/ok/miss TOTALS to the header (fewest placement
+changes) and a max-combo pass makes the longest unbroken run equal the header's
+max_combo, so counts/acc/score are header-exact while WHICH notes broke combo
+is now correct. Then for any frame time it builds the right->left scrolling
+scene: hit target, don/kat notes, drumroll bodies, swells, and hit explosions.
 """
 from __future__ import annotations
 
@@ -42,6 +48,94 @@ def mods_score_multiplier(mods: int) -> float:
         if mods & bit:
             m *= mult
     return m
+
+
+# osu!(lazer) taiko hit windows. Stable uses od_to_hit_windows_ms (models.py:
+# GREAT=50-3·OD, OK=120-8·OD). Lazer replays (game_version >= LAZER_GAME_VERSION,
+# the same < 30000000 stable / else lazer split the std engine uses) use
+# osu.Game.Rulesets.Taiko/Scoring/TaikoHitWindows.cs: DifficultyRange-interpolated
+# Great 50/35/20, Ok 120/80/50 (ms half-widths at OD 0/5/10). The Miss range
+# (135/95/70) only bounds CanBeHit; we treat the OK window edge as the hittable
+# boundary (a note past OK+ with no matching press is a miss), matching stable.
+LAZER_GAME_VERSION = 30000000
+
+
+def _difficulty_range(diff: float, min_v: float, mid_v: float, max_v: float) -> float:
+    """IBeatmapDifficultyInfo.DifficultyRange — linear interpolation across
+    OD 0/5/10 (ppy/osu osu.Game/Beatmaps/IBeatmapDifficultyInfo.cs)."""
+    if diff > 5:
+        return mid_v + (max_v - mid_v) * (diff - 5.0) / 5.0
+    if diff < 5:
+        return mid_v - (mid_v - min_v) * (5.0 - diff) / 5.0
+    return mid_v
+
+
+def _lazer_taiko_windows(od: float) -> tuple[float, float]:
+    """(GREAT, OK) half-widths in ms from lazer's TaikoHitWindows."""
+    great = _difficulty_range(od, 50.0, 35.0, 20.0)
+    ok = _difficulty_range(od, 120.0, 80.0, 50.0)
+    return great, ok
+
+
+def _key_edges(frames, attr) -> list:
+    """Rising-edge press times of one physical taiko key (cl/cr/rl/rr) — a
+    per-key stream, unlike hit_events' colour-collapsed edges."""
+    out = []
+    prev = False
+    for f in frames:
+        cur = getattr(f, attr)
+        if cur and not prev:
+            out.append(f.time_ms)
+        prev = cur
+    return out
+
+
+def _nearest_abs(sorted_times, t) -> float:
+    """|delta| to the nearest value in a time-sorted list (1e9 if empty)."""
+    if not sorted_times:
+        return 1e9
+    j = bisect.bisect_left(sorted_times, t)
+    best = 1e9
+    for k in (j - 1, j):
+        if 0 <= k < len(sorted_times):
+            best = min(best, abs(sorted_times[k] - t))
+    return best
+
+
+def _longest_run(res_in_time_order) -> int:
+    """Longest run of non-MISS results = the displayed max combo."""
+    run = mx = 0
+    for r in res_in_time_order:
+        if r == MISS:
+            run = 0
+        else:
+            run += 1
+            if run > mx:
+                mx = run
+    return mx
+
+
+class _JudgeState:
+    """Mutable per-note judgment arrays shared by the reconcile passes (all
+    indexed by note index; `order_t` gives time order)."""
+    __slots__ = ("order_t", "col", "res", "hit_t", "signed", "err_mag",
+                 "real_press", "miss_prox", "don_press", "kat_press",
+                 "great_w", "ok_w")
+
+    def __init__(self, order_t, col, res, hit_t, signed, err_mag, real_press,
+                 miss_prox, don_press, kat_press, great_w, ok_w):
+        self.order_t = order_t
+        self.col = col
+        self.res = res
+        self.hit_t = hit_t
+        self.signed = signed
+        self.err_mag = err_mag
+        self.real_press = real_press
+        self.miss_prox = miss_prox
+        self.don_press = don_press
+        self.kat_press = kat_press
+        self.great_w = great_w
+        self.ok_w = ok_w
 
 
 class TaikoSim:
@@ -98,7 +192,17 @@ class TaikoSim:
                 prev = cur
             self._zedges[zone] = edges
 
+        # VISUAL hit windows: the shipped stable formula, UNCONDITIONALLY — these
+        # drive the miss-judgement/explosion display time (note.time + ok_w) and
+        # the HUD, so keeping them exactly as before makes clean plays render
+        # byte-identically. The game-version-aware windows (lazer TaikoHitWindows
+        # for lazer replays) are used ONLY inside the placement sweep in _judge.
         self.great_w, self.ok_w = od_to_hit_windows_ms(bm.od)
+        _gv = int(getattr(meta, "game_version", 0) or 0)
+        if _gv >= LAZER_GAME_VERSION:
+            self.sweep_great_w, self.sweep_ok_w = _lazer_taiko_windows(bm.od)
+        else:
+            self.sweep_great_w, self.sweep_ok_w = self.great_w, self.ok_w
         self.notes = [o for o in bm.objects
                       if o.kind in (TaikoType.DON, TaikoType.KAT)]
         self.rolls = [o for o in bm.objects
@@ -136,23 +240,53 @@ class TaikoSim:
     # --- judgment -------------------------------------------------------------
 
     def _judge(self, frames):
-        # Estimate each note's hit timing from the replay (nearest same-type
-        # press, generous ±200ms so swell mash / off taps don't starve it),
-        # then DISTRIBUTE the .osr's authoritative great/ok/miss totals across
-        # notes by timing quality. The header is ground truth; a frame-by-frame
-        # sim drifts (swells inflate hits, windows differ from the client), so
-        # we never let it override the real counts — we only use it to decide
-        # *which* notes were the oks/misses (for combo breaks + explosions).
+        """Hybrid judgment: keep the shipped timing/great-ok layer for clean
+        plays byte-identical, fix ONLY which notes broke combo.
+
+        (A) VISUAL/TIMING LAYER (unchanged): the original greedy nearest-match
+        (collapsed-edge, ±200 ms) gives each note its jump-off/explosion time and
+        the great/ok split ranks notes by that timing error. A clean full-combo
+        therefore renders exactly as before — no placement to get wrong.
+
+        (B) MISS PLACEMENT (the fix): a faithful in-order per-key sweep — each
+        rising-edge press consumes the FRONTMOST still-hittable same-colour note
+        whose OK window covers it (taiko notelock, no press-stealing, no slop; a
+        note whose OK window passes unhit is a MISS) — decides WHICH notes the
+        player actually missed. Ported from osu.Game.Rulesets.Taiko/Objects/
+        Drawables/DrawableHit.cs (CheckForResult / HitWindows.ResultFor|CanBeHit)
+        + the DrawableTaikoHitObject input path (a press judges the earliest
+        unjudged matching-colour note; a big/finisher note needs only one
+        correct-colour hit for the base result). Crucially it uses PER-KEY press
+        edges (cl|cr = don, rl|rr = kat): hit_events collapses cl|cr into one
+        `don` boolean and only fires on the combined rising edge, losing the
+        overlapping/alternating same-colour taps a taiko stream is full of.
+
+        (C) RECONCILE (header = count-authority): _reconcile snaps the miss TOTAL
+        to the .osr header AND makes the longest unbroken run equal the header's
+        max_combo, keeping the honest pressless misses and adding the rest on the
+        most miss-like notes outside the protected clean run — the std renderer's
+        reconcile-after-sim + max-combo pass. Counts/acc/score stay header-exact.
+        """
         hits = hit_events(frames)
         htimes = [hh[0] for hh in hits]
         # Press times (sorted) — reused by the swell to derive mash progress
-        # (completion = hits-in-window / required_hits) for the Argon swell.
+        # (completion = hits-in-window / required_hits). Kept as the collapsed
+        # stream so swell visuals are unchanged.
         self._hit_times = htimes
-        n = len(self.notes)
-        err = [1e9] * n            # timing error per note (1e9 = no nearby hit)
-        hit_t = [0] * n            # matched hit time (for resolve/explosion)
+
+        notes = self.notes
+        n = len(notes)
+        ok_w = self.ok_w                              # VISUAL window (unchanged)
+        # PLACEMENT windows for the sweep: lazer TaikoHitWindows for lazer
+        # replays, stable formula for stable (auto-detected from game_version).
+        sweep_great_w, sweep_ok_w = self.sweep_great_w, self.sweep_ok_w
+
+        # --- (A) shipped greedy nearest-match: VISUAL timing + great/ok layer.
+        # Verbatim from the original _judge so clean plays render byte-identical.
+        old_err = [1e9] * n         # timing error per note (1e9 = no nearby hit)
+        old_hit_t = [0] * n         # matched hit time (jump-off / explosion)
         used = [False] * len(hits)
-        for i, note in enumerate(self.notes):
+        for i, note in enumerate(notes):
             want = "don" if note.kind is TaikoType.DON else "kat"
             j = bisect.bisect_left(htimes, note.time_ms)
             best, bd = -1, 201.0
@@ -164,50 +298,80 @@ class TaikoSim:
                     bd, best = d, k
             if best >= 0:
                 used[best] = True
-                err[i] = bd
-                hit_t[i] = hits[best][0]
+                old_err[i] = bd
+                old_hit_t[i] = hits[best][0]
             else:
-                hit_t[i] = int(note.time_ms + self.ok_w)
+                old_hit_t[i] = int(note.time_ms + ok_w)
 
+        # --- (B) per-key in-order sweep: honest MISS PLACEMENT. A don note is hit
+        # by EITHER centre key (cl/cr), a kat by EITHER rim key (rl/rr) — a
+        # colour's presses are the UNION of its two keys' rising edges.
+        don_press = sorted(_key_edges(frames, "cl") + _key_edges(frames, "cr"))
+        kat_press = sorted(_key_edges(frames, "rl") + _key_edges(frames, "rr"))
+        order_t = sorted(range(n), key=lambda i: notes[i].time_ms)
+        col = ["don" if notes[i].kind is TaikoType.DON else "kat"
+               for i in range(n)]
+        sres = [MISS] * n           # honest sweep result (hit vs MISS)
+        s_err = [1e9] * n           # sweep timing error (hit quality)
+        real_press = [False] * n    # judged by a genuine in-window press
+        for want, presses in (("don", don_press), ("kat", kat_press)):
+            seq = [i for i in order_t if col[i] == want]
+            ni = 0
+            for p in presses:
+                # notes whose OK window has fully passed can no longer be hit
+                while ni < len(seq) and notes[seq[ni]].time_ms + sweep_ok_w < p:
+                    ni += 1
+                if ni >= len(seq):
+                    break
+                i = seq[ni]
+                d = p - notes[i].time_ms
+                if -sweep_ok_w <= d <= sweep_ok_w:         # window covers press
+                    sres[i] = GREAT if abs(d) <= sweep_great_w else OK
+                    s_err[i] = abs(d)
+                    real_press[i] = True
+                    ni += 1
+                # else: press earlier than this note's window — wasted (no steal)
+
+        # nearest matching-colour press |delta| for each honest MISS (reconcile
+        # ranking: near press = ambiguous, un-missed first; far/absent = a real
+        # combo break that must stay a miss).
+        miss_prox = [1e9] * n
+        for i in range(n):
+            if sres[i] == MISS:
+                stream = don_press if col[i] == "don" else kat_press
+                miss_prox[i] = _nearest_abs(stream, notes[i].time_ms)
+
+        st = _JudgeState(order_t, col, sres, old_hit_t, [0.0] * n, s_err,
+                         real_press, miss_prox, don_press, kat_press,
+                         sweep_great_w, sweep_ok_w)
+        # --- (C) choose the final miss set: header miss total + max_combo ---
+        is_miss = self._reconcile(st)
+
+        # --- (D) assemble results: misses at their window-close time; hits keep
+        # the shipped greedy timing, split into the header's GREAT/OK by that
+        # (shipped) timing error so a clean play is byte-identical.
         m = self.meta
-        n_great = getattr(m, "count_300", 0) or 0
-        n_ok = getattr(m, "count_100", 0) or 0
-        n_miss = getattr(m, "count_miss", 0) or 0
+        hg = (int(getattr(m, "count_300", 0) or 0) if m is not None
+              else sum(1 for i in range(n) if not is_miss[i]))
+        hit_idx = [i for i in range(n) if not is_miss[i]]
+        hit_idx.sort(key=lambda i: old_err[i])       # stable: ties keep note order
         results: list[tuple[int, str]] = [(0, MISS)] * n
-        if m is not None and (n_great + n_ok + n_miss) == n and n > 0:
-            # authoritative distribution: best-timed notes are GREAT, then OK,
-            # worst-timed (or unmatched) are the misses.
-            order_q = sorted(range(n), key=lambda i: err[i])  # best first
-            for rank, i in enumerate(order_q):
-                if rank < n_great:
-                    res = GREAT
-                elif rank < n_great + n_ok:
-                    res = OK
-                else:
-                    res = MISS
-                rt = hit_t[i] if res != MISS else int(self.notes[i].time_ms + self.ok_w)
-                results[i] = (rt, res)
-                self.note_hit[id(self.notes[i])] = (rt, res)
-        else:
-            # fallback: per-note window judgment (totals may not sum to notes,
-            # e.g. drumroll-heavy maps where .osr counts include tick scoring).
-            for i, note in enumerate(self.notes):
-                if err[i] <= self.ok_w:
-                    res = GREAT if err[i] <= self.great_w else OK
-                    rt = hit_t[i]
-                else:
-                    res = MISS
-                    rt = int(note.time_ms + self.ok_w)
-                results[i] = (rt, res)
-                self.note_hit[id(note)] = (rt, res)
+        for rank, i in enumerate(hit_idx):
+            results[i] = (old_hit_t[i], GREAT if rank < hg else OK)
+        for i in range(n):
+            if is_miss[i]:
+                results[i] = (int(notes[i].time_ms + ok_w), MISS)
+            self.note_hit[id(notes[i])] = results[i]
+
         order = sorted(range(len(results)), key=lambda i: results[i][0])
         self._rt = [results[i][0] for i in order]
-        # signed hit errors for the hit-error/UR bar: (judged_time, err_ms, res).
-        # Only notes with a real matched press (err<1e9) and a hit result.
+        # signed hit errors for the hit-error/UR bar: only notes with a genuine
+        # matched press (old_err<1e8) and a hit result — same set the shipped
+        # renderer drew.
         self._hit_errors = sorted(
-            (results[i][0], hit_t[i] - self.notes[i].time_ms, results[i][1])
+            (results[i][0], old_hit_t[i] - notes[i].time_ms, results[i][1])
             for i in range(n)
-            if results[i][1] != MISS and err[i] < 1e8)
+            if results[i][1] != MISS and old_err[i] < 1e8)
         self._he_times = [e[0] for e in self._hit_errors]
         self._he_csum = [0.0]
         self._he_csq = [0.0]
@@ -218,16 +382,170 @@ class TaikoSim:
         hp = 1.0
         self._cum: list[tuple] = []
         for i in order:
-            res = results[i][1]
-            if res == GREAT:
+            r = results[i][1]
+            if r == GREAT:
                 great += 1; combo += 1; score += 300; hp = min(1.0, hp + 0.02)
-            elif res == OK:
+            elif r == OK:
                 ok += 1; combo += 1; score += 100; hp = min(1.0, hp + 0.005)
             else:
                 miss += 1; combo = 0; hp = max(0.0, hp - 0.05)
             self._cum.append((combo, great, ok, miss, score, hp))
         self._build_scorev2(order, results)
         self._setup_health(order, results)
+
+    # --- reconcile (header = count-authority; std's reconcile-after-sim) -------
+
+    def _reconcile(self, st):
+        """Choose the FINAL miss set. Snap the miss TOTAL to the .osr header AND
+        make the longest unbroken run equal the header max_combo — the std
+        renderer's reconcile-after-sim + max-combo reposition, specialised to
+        taiko's linear note stream. Returns is_miss[] (bool, by note index); the
+        caller supplies the hit timing + great/ok split from the shipped
+        greedy-match layer, so a clean play is byte-identical.
+
+        The honest per-key sweep already lands the clean sections perfectly (its
+        longest run typically already equals the real max_combo), but the .osr
+        miss count is higher: in busy sections the greedy sweep 'saves' notes with
+        stray mash presses that the client counted as misses. We (1) PROTECT the
+        honest peak run (the max_combo-length clean stretch) so the displayed max
+        combo is preserved, and (2) place the header's miss TOTAL on the most
+        miss-like notes OUTSIDE that stretch — keeping every honest pressless miss
+        (a real combo break) and never breaking the protected clean run."""
+        m = self.meta
+        n = len(st.res)
+        seq = st.order_t
+        sim_g = sum(1 for r in st.res if r == GREAT)
+        sim_o = sum(1 for r in st.res if r == OK)
+        sim_m = sum(1 for r in st.res if r == MISS)
+        self._sim_counts = (sim_g, sim_o, sim_m)
+        honest_longest = _longest_run([st.res[i] for i in seq])
+        self._maxcombo_before = honest_longest
+        is_miss = [st.res[i] == MISS for i in range(n)]
+        if m is None or n == 0:
+            self._reconcile_note = "taiko: no meta — honest sim kept"
+            self._maxcombo_target = 0
+            self._maxcombo_after = honest_longest
+            self._maxcombo_note = f"taiko: max combo {honest_longest} (honest)"
+            return is_miss
+        hg = int(getattr(m, "count_300", 0) or 0)
+        ho = int(getattr(m, "count_100", 0) or 0)
+        hm = int(getattr(m, "count_miss", 0) or 0)
+        T = int(getattr(m, "max_combo", 0) or 0)
+        self._maxcombo_target = T
+        if hg + ho + hm != n:
+            # totals fold in drumroll/swell tick scoring or a note-parse
+            # off-by-one — keep the honest per-note-window sim; score anchors to
+            # the .osr in _build_scorev2.
+            self._reconcile_note = (
+                f"taiko: header totals {hg}/{ho}/{hm} sum != {n} notes — honest "
+                f"sim kept ({sim_g}/{sim_o}/{sim_m})")
+            self._maxcombo_after = honest_longest
+            self._maxcombo_note = (
+                f"taiko: max combo {honest_longest} (honest; header {T})")
+            return is_miss
+
+        M = hm
+        # per-POSITION hit-likeness (immutable snapshot of the honest sweep):
+        # small = a clean hit; large = a miss-like note. Real hits rank by timing
+        # error; misses rank AFTER every hit by how far the nearest matching press
+        # sits (a pressless miss = worst = a definite combo break).
+        qpos = [0.0] * n
+        hmiss = [0] * n
+        for p in range(n):
+            i = seq[p]
+            if st.res[i] == MISS:
+                qpos[p] = st.ok_w + 1.0 + st.miss_prox[i]
+                hmiss[p] = 1
+            else:
+                qpos[p] = st.err_mag[i]
+
+        chosen = self._choose_miss_positions(n, M, T, qpos, hmiss)
+        is_miss = [False] * n
+        for p in chosen:
+            is_miss[seq[p]] = True
+
+        final_longest = _longest_run(
+            [MISS if is_miss[i] else GREAT for i in seq])
+        self._maxcombo_after = final_longest
+        changed = sum(1 for i in range(n) if (st.res[i] == MISS) != is_miss[i])
+        self._reconcile_note = (
+            f"taiko: honest {sim_g}/{sim_o}/{sim_m} -> header {hg}/{ho}/{hm} "
+            f"({changed} miss-set changes)")
+        note = (f"taiko: max combo honest {honest_longest} -> {final_longest} "
+                f"(target {T})")
+        if T > 0 and final_longest != T:
+            note = "!!! " + note + " — MISMATCH"
+            print("[taiko-renderer] " + note, file=__import__("sys").stderr)
+        self._maxcombo_note = note
+        return is_miss
+
+    def _choose_miss_positions(self, n, M, T, qpos, hmiss):
+        """Pick exactly M note POSITIONS (time order) to be misses so the longest
+        run == T, preferring the most miss-like notes and keeping the honest
+        pressless misses. Returns a set of positions in [0, n)."""
+        if M <= 0:
+            return set()
+        if M >= n:
+            return set(range(n))
+        if T <= 0:                                  # no combo target — pure quality
+            return set(sorted(range(n), key=lambda p: (-qpos[p], p))[:M])
+
+        # (a) protected peak = the T-length window with the FEWEST honest misses
+        # inside (tie: most hit-like = lowest total q), so forcing it to a clean
+        # run disturbs the honest sim least. For a faithful sim this is exactly
+        # the honest peak run.
+        Tw = min(T, n)
+        pre_hm = [0] * (n + 1)
+        pre_q = [0.0] * (n + 1)
+        for p in range(n):
+            pre_hm[p + 1] = pre_hm[p] + hmiss[p]
+            pre_q[p + 1] = pre_q[p] + qpos[p]
+        a, best = 0, None
+        for s in range(0, n - Tw + 1):
+            e = s + Tw
+            key = (pre_hm[e] - pre_hm[s], pre_q[e] - pre_q[s])
+            if best is None or key < best:
+                best, a = key, s
+        b = a + Tw - 1
+        protect = set(range(a, b + 1))
+
+        chosen = set()
+        # (b) bound the protected run at exactly T: the notes just outside it are
+        # breaks (free when they were already honest misses; a count-preserving
+        # trim otherwise).
+        if a - 1 >= 0:
+            chosen.add(a - 1)
+        if b + 1 <= n - 1:
+            chosen.add(b + 1)
+        # (c) keep every honest miss OUTSIDE the protected run (real combo breaks)
+        for p in range(n):
+            if hmiss[p] and p not in protect:
+                chosen.add(p)
+        # (d) top up to exactly M with the most miss-like notes OUTSIDE the
+        # protected run (never break the clean stretch)
+        if len(chosen) < M:
+            pool = sorted((p for p in range(n)
+                           if p not in chosen and p not in protect),
+                          key=lambda p: (-qpos[p], p))
+            for p in pool:
+                if len(chosen) >= M:
+                    break
+                chosen.add(p)
+        # (e) still short only if the busy region can't hold M (rare): allow
+        # breaking the protected run at its most miss-like notes
+        if len(chosen) < M:
+            pool = sorted((p for p in protect if p not in chosen),
+                          key=lambda p: (-qpos[p], p))
+            for p in pool:
+                if len(chosen) >= M:
+                    break
+                chosen.add(p)
+        # (f) too many (boundary trims overshot a tiny M): drop the most hit-like
+        # non-honest-miss break
+        while len(chosen) > M:
+            drop = min(chosen, key=lambda p: (hmiss[p], -qpos[p], -p))
+            chosen.discard(drop)
+        return chosen
 
     def _setup_health(self, order, results):
         """HP source + fail detection. Ground-truth is the .osr life-bar graph;
