@@ -12,6 +12,7 @@ import math
 
 from .argon import _const as AC
 from .argon import geometry as ag_geom
+from .dim import build_dim_envelope
 from .taiko_skin import TaikoSkin
 from .models import (
     SceneState,
@@ -114,8 +115,21 @@ class TaikoSim:
             _first = min(bm.objects, key=lambda o: o.time_ms)
             _fsv = max(getattr(_first, "scroll_vel", 1.0) or 1.0, 0.1)
             self.first_spawn_ms = _first.time_ms - self.geo.scroll_time / _fsv
+            _preempt = _first.time_ms - self.first_spawn_ms
         else:
             self.first_spawn_ms = 0.0
+            _preempt = 0.0
+        # Background dim envelope (std's DimEnvelope, ported in dim.py): the
+        # dim GLIDES intro→game as the first note begins its scroll-in,
+        # brightens into [Events] breaks and re-dims at the resume anchor —
+        # smoothstep over the same 900 ms std/catch use, replacing the old
+        # constant bg_dim_game level (intro and breaks previously rendered at
+        # gameplay dim; bg_dim_intro/bg_dim_breaks were parsed but unused).
+        self._dim_env = build_dim_envelope(
+            cfg.bg_dim_intro / 100.0, cfg.bg_dim_game / 100.0,
+            cfg.bg_dim_breaks / 100.0,
+            [o.time_ms for o in bm.objects], _preempt,
+            getattr(bm, "breaks", []) or [])
         self.note_hit: dict[int, tuple[int, str]] = {}
         self._judge(frames)
 
@@ -421,7 +435,9 @@ class TaikoSim:
         # ArgonPlayfieldBackgroundRight (the note lane) = black @0.7 so the bg
         # shows through dimly. Boundary = the input-drum edge, not the target. ---
         if self.has_bg:
-            v = max(0.0, 1.0 - self.cfg.bg_dim_game / 100.0)
+            # preset bg dim via the DimEnvelope (intro/game/breaks levels with
+            # std's smoothstep glides): % dim (higher=darker) → brightness
+            v = max(0.0, 1.0 - self._dim_env.level(t))
             sp.append(Sprite(w / 2, h / 2, w, h, "bg", (v, v, v, 1.0)))
         strip_h = g.pf_h * 1.18
         if self.sk_lane:
